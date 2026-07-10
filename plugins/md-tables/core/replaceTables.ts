@@ -145,28 +145,60 @@ function wrapAndInsert(nodes: Node[], replacement: HTMLElement): void {
  * own lines — never surrounding text, even when a line shares a Text node with
  * non-table text — by moving them into a hidden `.mdt-src` span rather than deleting
  * them, so `restoreReplacedTables` can bring the original view back exactly.
- * No-op for any block whose lines can't be located in the DOM.
+ * No-op for any block whose lines can't be located in the DOM — e.g. a table cell
+ * containing a Discord mention/emoji renders differently in the DOM than in the raw
+ * `message.content` string, so its lines never match.
  * Blocks are applied last-to-first so earlier ranges stay valid.
+ *
+ * Returns the number of table blocks that were successfully located and replaced.
+ * 0 means nothing in the DOM matched, and `contentEl` is left unchanged (including
+ * undoing `normalizeNewlines`'s text-node split, which is otherwise required for
+ * matching to work) — callers use this to decide whether it's safe to mark the
+ * element as processed (see index.tsx's `processRow`).
  */
 export function replaceTablesInContent(
   contentEl: HTMLElement,
   content: string,
   blocks: TableBlock[],
   makeTable: (block: TableBlock) => HTMLElement,
-): void {
-  if (!blocks.length) return;
+): number {
+  if (!blocks.length) return 0;
+
+  // Snapshot the original children BEFORE normalizeNewlines mutates them, so a
+  // zero-match outcome can be undone exactly (see below).
+  const originalChildren = Array.from(contentEl.childNodes);
 
   normalizeNewlines(contentEl);
   const contentLines = content.split("\n");
   const lines = collectLines(contentEl);
 
-  for (const block of [...blocks].reverse()) {
+  // Compute all match ranges FIRST, without mutating the DOM — matchRange only
+  // reads `lines`. This lets us tell, before touching anything, whether the
+  // zero-match case applies.
+  const matched: { block: TableBlock; range: Node[] }[] = [];
+  for (const block of blocks) {
     const blockLines = contentLines
       .slice(block.startLine, block.endLine + 1)
       .map((s) => s.trim());
     const range = matchRange(lines, blockLines);
-    if (range) wrapAndInsert(range, makeTable(block));
+    if (range) matched.push({ block, range });
   }
+
+  if (matched.length === 0) {
+    // Nothing matched: undo normalizeNewlines's text-node split so `contentEl` is
+    // left exactly as it was (same node identities, same childNodes.length) — no
+    // partial mutation leaks out of a no-op call.
+    while (contentEl.firstChild) contentEl.removeChild(contentEl.firstChild);
+    for (const node of originalChildren) contentEl.appendChild(node);
+    return 0;
+  }
+
+  // Apply last-to-first so earlier ranges (computed against the pre-mutation
+  // `lines` snapshot) stay valid as later wraps rearrange sibling nodes.
+  for (const { block, range } of [...matched].reverse()) {
+    wrapAndInsert(range, makeTable(block));
+  }
+  return matched.length;
 }
 
 /**

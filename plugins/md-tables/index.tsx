@@ -86,8 +86,15 @@ function processRow(row: HTMLElement) {
   const blocks = parseTables(content);
   if (!blocks.length) return;
 
-  contentEl.dataset.mdTables = "1";
-  replaceTablesInContent(contentEl, content, blocks, renderTable);
+  // Only persist the reprocess guard once a table was actually located and
+  // rendered in the DOM. A table cell containing a Discord mention/custom emoji
+  // renders differently in the DOM than in raw `message.content` (e.g. `<@123>`
+  // becomes the text "@Bob"), so `matchRange` can silently fail to locate it. If we
+  // set the guard unconditionally, that message's raw pipe text would stay visible
+  // forever with no retry path. Leaving the guard unset means the next dispatch
+  // retries — cheap, since `parseTables` is pure and skipped DOM work is free.
+  const replaced = replaceTablesInContent(contentEl, content, blocks, renderTable);
+  if (replaced > 0) contentEl.dataset.mdTables = "1";
 }
 
 const TRIGGERS = [
