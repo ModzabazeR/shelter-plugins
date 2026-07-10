@@ -1,0 +1,8 @@
+{
+  "name": "md-tables",
+  "private": true,
+  "type": "module",
+  "dependencies": {
+    "solid-js": "1.6.16"
+  }
+}

@@ -1,0 +1,49 @@
+name: Deploy Shelter plugins to Pages
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "plugins/**"
+      - "lune.config.js"
+      - "package.json"
+      - "pnpm-lock.yaml"
+      - "tsconfig.json"
+      - ".github/workflows/pages.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: pages-deploy
+  cancel-in-progress: true
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Install
+        run: pnpm install --no-frozen-lockfile
+      # Gate the deploy: lune builds with esbuild, which strips types without
+      # checking them, so a type error would otherwise ship silently.
+      - name: Typecheck + test
+        run: |
+          pnpm typecheck
+          pnpm test
+      - name: Build plugins + static site
+        run: |
+          pnpm exec lune ci
+          pnpm exec lune ssg ci
+      - uses: peaceiris/actions-gh-pages@v4
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          publish_dir: dist
+          publish_branch: gh-pages
