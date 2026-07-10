@@ -1,6 +1,6 @@
 import { describe, expect, test } from "vitest";
 import { parseTables, type TableBlock } from "./parseTables";
-import { replaceTablesInContent } from "./replaceTables";
+import { replaceTablesInContent, restoreReplacedTables } from "./replaceTables";
 
 function stubMakeTable(_block: TableBlock): HTMLElement {
   const table = document.createElement("table");
@@ -27,12 +27,16 @@ describe("replaceTablesInContent", () => {
     // Act
     replaceTablesInContent(contentEl, content, blocks, stubMakeTable);
 
-    // Assert
+    // Assert — table rendered, surrounding text preserved, table lines hidden (not
+    // visible as raw text, even though the hidden `.mdt-src` node still exists).
     const tables = contentEl.querySelectorAll("table.stub");
     expect(tables).toHaveLength(1);
     expect(contentEl.textContent).toContain("intro");
     expect(contentEl.textContent).toContain("end");
-    expect(contentEl.textContent).not.toContain("| a | b |");
+    const srcSpan = contentEl.querySelector(".mdt-src") as HTMLElement | null;
+    expect(srcSpan).not.toBeNull();
+    expect(srcSpan!.textContent).toContain("| a | b |");
+    expect(srcSpan!.style.display).toBe("none");
   });
 
   test("replaces a table held in a single \\n-delimited text node without deleting surrounding text", () => {
@@ -51,7 +55,10 @@ describe("replaceTablesInContent", () => {
     expect(tables).toHaveLength(1);
     expect(contentEl.textContent).toContain("intro");
     expect(contentEl.textContent).toContain("end");
-    expect(contentEl.textContent).not.toContain("| a | b |");
+    const srcSpan = contentEl.querySelector(".mdt-src") as HTMLElement | null;
+    expect(srcSpan).not.toBeNull();
+    expect(srcSpan!.textContent).toContain("| a | b |");
+    expect(srcSpan!.style.display).toBe("none");
   });
 
   test("replaces two tables in one contentEl, preserving the text between them", () => {
@@ -82,8 +89,11 @@ describe("replaceTablesInContent", () => {
     expect(contentEl.textContent).toContain("before");
     expect(contentEl.textContent).toContain("middle");
     expect(contentEl.textContent).toContain("after");
-    expect(contentEl.textContent).not.toContain("| a |");
-    expect(contentEl.textContent).not.toContain("| b |");
+    const srcSpans = contentEl.querySelectorAll(".mdt-src");
+    expect(srcSpans).toHaveLength(2);
+    srcSpans.forEach((span) => {
+      expect((span as HTMLElement).style.display).toBe("none");
+    });
   });
 
   test("no-ops when the block's lines cannot be located in contentEl", () => {
@@ -102,8 +112,119 @@ describe("replaceTablesInContent", () => {
     // found inside it.
     replaceTablesInContent(contentEl, otherContent, blocksForOtherContent, stubMakeTable);
 
-    // Assert
+    // Assert — no table inserted, no hidden source span, DOM unchanged.
     expect(contentEl.querySelectorAll("table.stub")).toHaveLength(0);
+    expect(contentEl.querySelectorAll(".mdt-src")).toHaveLength(0);
     expect(contentEl.innerHTML).toBe(originalHtml);
+  });
+
+  test("hides table source lines behind .mdt-src instead of deleting them", () => {
+    // Arrange
+    const lines = ["intro", "| a | b |", "| - | - |", "| 1 | 2 |", "end"];
+    const content = lines.join("\n");
+    const contentEl = document.createElement("div");
+    appendBrSeparatedLines(contentEl, lines);
+    const blocks = parseTables(content);
+
+    // Act
+    replaceTablesInContent(contentEl, content, blocks, stubMakeTable);
+
+    // Assert — the raw pipe text still exists in the DOM (not deleted), just hidden.
+    const srcSpan = contentEl.querySelector(".mdt-src") as HTMLElement | null;
+    expect(srcSpan).not.toBeNull();
+    expect(srcSpan!.textContent).toContain("| a | b |");
+    expect(srcSpan!.textContent).toContain("| - | - |");
+    expect(srcSpan!.textContent).toContain("| 1 | 2 |");
+    expect(srcSpan!.style.display).toBe("none");
+    // Surrounding text remains visible (outside the hidden span).
+    expect(contentEl.textContent).toContain("intro");
+    expect(contentEl.textContent).toContain("end");
+  });
+
+  test("round-trip: restoreReplacedTables restores <br>-separated content exactly", () => {
+    // Arrange
+    const lines = ["intro", "| a | b |", "| - | - |", "| 1 | 2 |", "end"];
+    const content = lines.join("\n");
+    const contentEl = document.createElement("div");
+    appendBrSeparatedLines(contentEl, lines);
+    const originalTextContent = contentEl.textContent;
+    const blocks = parseTables(content);
+
+    // Act — replace
+    replaceTablesInContent(contentEl, content, blocks, stubMakeTable);
+
+    // Assert — replaced state: table present, source hidden
+    expect(contentEl.querySelectorAll("table.stub")).toHaveLength(1);
+    const srcSpan = contentEl.querySelector(".mdt-src") as HTMLElement | null;
+    expect(srcSpan).not.toBeNull();
+    expect(srcSpan!.style.display).toBe("none");
+
+    // Act — restore
+    restoreReplacedTables(contentEl);
+
+    // Assert — restored state: identical text, no leftover table or hidden span
+    expect(contentEl.textContent).toBe(originalTextContent);
+    expect(contentEl.querySelectorAll("table.stub")).toHaveLength(0);
+    expect(contentEl.querySelectorAll(".mdt-src")).toHaveLength(0);
+  });
+
+  test("round-trip: restoreReplacedTables restores a single \\n text node exactly", () => {
+    // Arrange
+    const content = "intro\n| a | b |\n| - | - |\n| 1 | 2 |\nend";
+    const contentEl = document.createElement("div");
+    contentEl.append(document.createTextNode(content));
+    const originalTextContent = contentEl.textContent;
+    const blocks = parseTables(content);
+
+    // Act — replace
+    replaceTablesInContent(contentEl, content, blocks, stubMakeTable);
+
+    // Assert — replaced state
+    expect(contentEl.querySelectorAll("table.stub")).toHaveLength(1);
+    expect(contentEl.querySelector(".mdt-src")).not.toBeNull();
+
+    // Act — restore
+    restoreReplacedTables(contentEl);
+
+    // Assert — restored state
+    expect(contentEl.textContent).toBe(originalTextContent);
+    expect(contentEl.querySelectorAll("table.stub")).toHaveLength(0);
+    expect(contentEl.querySelectorAll(".mdt-src")).toHaveLength(0);
+  });
+
+  test("round-trip: two tables are both replaced and both restored exactly", () => {
+    // Arrange
+    const lines = [
+      "before",
+      "| a |",
+      "| - |",
+      "| 1 |",
+      "middle",
+      "| b |",
+      "| - |",
+      "| 2 |",
+      "after",
+    ];
+    const content = lines.join("\n");
+    const contentEl = document.createElement("div");
+    appendBrSeparatedLines(contentEl, lines);
+    const originalTextContent = contentEl.textContent;
+    const blocks = parseTables(content);
+    expect(blocks).toHaveLength(2);
+
+    // Act — replace
+    replaceTablesInContent(contentEl, content, blocks, stubMakeTable);
+
+    // Assert — replaced state
+    expect(contentEl.querySelectorAll("table.stub")).toHaveLength(2);
+    expect(contentEl.querySelectorAll(".mdt-src")).toHaveLength(2);
+
+    // Act — restore
+    restoreReplacedTables(contentEl);
+
+    // Assert — restored state
+    expect(contentEl.textContent).toBe(originalTextContent);
+    expect(contentEl.querySelectorAll("table.stub")).toHaveLength(0);
+    expect(contentEl.querySelectorAll(".mdt-src")).toHaveLength(0);
   });
 });

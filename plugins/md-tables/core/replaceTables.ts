@@ -6,6 +6,13 @@
  * table line shares a Text node with non-table content (a single Text node can hold
  * several "\n"-separated lines when Discord doesn't split lines into <br> elements).
  *
+ * The replacement is NON-DESTRUCTIVE: the matched raw-line nodes are never removed.
+ * They're moved (in order, at their original position) into a single hidden
+ * `<span class="mdt-src" style="display:none">` wrapper, and the rendered table is
+ * inserted immediately next to that wrapper. `restoreReplacedTables()` reverses this
+ * exactly — it removes every inserted table and unwraps every `.mdt-src` span, so
+ * `onUnload` can restore the original view without leaving the message blank.
+ *
  * This module is pure DOM manipulation: it never references the `shelter` global and
  * never formats cell content itself — the caller supplies `makeTable`.
  */
@@ -17,6 +24,14 @@ interface Line {
   nodes: Node[];
 }
 
+// Marks a table this module inserted, so `restoreReplacedTables` can find and remove
+// it regardless of whatever classes/structure the caller's `makeTable` used.
+const MDT_INSERTED_ATTR = "data-mdt-inserted";
+// `.mdt-wrap` is the Shelter integration's own wrapper class (see index.tsx). Matching
+// it too, alongside the internal attribute above, is defense in depth.
+const MDT_INSERTED_SELECTOR = `[${MDT_INSERTED_ATTR}], .mdt-wrap`;
+const MDT_SRC_CLASS = "mdt-src";
+
 function isNewlineMarker(node: Node): boolean {
   return node.nodeType === Node.TEXT_NODE && node.textContent === "\n";
 }
@@ -25,7 +40,9 @@ function isNewlineMarker(node: Node): boolean {
 // data contains "\n" is replaced by a run of sibling nodes — one Text node per
 // non-empty line chunk, plus a standalone one-character "\n" Text node marking each
 // line boundary (treated the same way a <br> is). Handles leading/trailing and
-// consecutive newlines without producing spurious nodes or crashing.
+// consecutive newlines without producing spurious nodes or crashing. This is
+// visually inert (identical rendered text, identical serialized innerHTML for plain
+// adjacent Text nodes) even when no block ends up matching.
 function normalizeNewlines(root: HTMLElement): void {
   const doc = root.ownerDocument ?? document;
   const textNodes = Array.from(root.childNodes).filter(
@@ -69,9 +86,9 @@ function collectLines(root: HTMLElement): Line[] {
       cur.text += child.textContent ?? "";
     }
   }
-  // FINDING 3: only append a trailing line when content actually followed the last
-  // boundary — otherwise a message ending in <br> (or a trailing "\n") would yield a
-  // spurious empty final line.
+  // Only append a trailing line when content actually followed the last boundary —
+  // otherwise a message ending in <br> (or a trailing "\n") would yield a spurious
+  // empty final line.
   if (cur.nodes.length > 0) lines.push(cur);
   return lines;
 }
@@ -100,25 +117,35 @@ function matchRange(lines: Line[], blockLines: string[]): Node[] | null {
   return null;
 }
 
-function replaceNodes(nodes: Node[], replacement: HTMLElement): void {
+// Move `nodes` (in order, at their shared original position) into a single hidden
+// `.mdt-src` wrapper, then insert `replacement` immediately after that wrapper.
+// Nothing is deleted — `restoreReplacedTables` can undo this exactly.
+function wrapAndInsert(nodes: Node[], replacement: HTMLElement): void {
   const first = nodes[0];
   const parent = first?.parentNode;
   if (!parent) return;
-  parent.insertBefore(replacement, first);
-  for (const n of nodes) {
-    try {
-      n.parentNode?.removeChild(n);
-    } catch {
-      /* already detached; ignore */
-    }
-  }
+
+  const doc = parent.ownerDocument ?? document;
+  const srcSpan = doc.createElement("span");
+  srcSpan.className = MDT_SRC_CLASS;
+  // Inline style as defense in depth (in case the plugin's CSS is unloaded/missing);
+  // the `.mdt-src{display:none}` rule in index.tsx's injected CSS is the primary one.
+  srcSpan.style.display = "none";
+
+  parent.insertBefore(srcSpan, first);
+  for (const n of nodes) srcSpan.appendChild(n);
+
+  replacement.setAttribute(MDT_INSERTED_ATTR, "1");
+  parent.insertBefore(replacement, srcSpan.nextSibling);
 }
 
 /**
  * Replace, inside `contentEl`, the DOM text of each table block (located by its
- * source line range in `content`) with `makeTable(block)`. Deletes ONLY the table's
+ * source line range in `content`) with `makeTable(block)`. Hides ONLY the table's
  * own lines — never surrounding text, even when a line shares a Text node with
- * non-table text. No-op for any block whose lines can't be located in the DOM.
+ * non-table text — by moving them into a hidden `.mdt-src` span rather than deleting
+ * them, so `restoreReplacedTables` can bring the original view back exactly.
+ * No-op for any block whose lines can't be located in the DOM.
  * Blocks are applied last-to-first so earlier ranges stay valid.
  */
 export function replaceTablesInContent(
@@ -138,6 +165,26 @@ export function replaceTablesInContent(
       .slice(block.startLine, block.endLine + 1)
       .map((s) => s.trim());
     const range = matchRange(lines, blockLines);
-    if (range) replaceNodes(range, makeTable(block));
+    if (range) wrapAndInsert(range, makeTable(block));
   }
+}
+
+/**
+ * Undo every replacement made by `replaceTablesInContent` within `root`: removes
+ * every inserted table (identified by the internal marker `wrapAndInsert` sets, and
+ * by the Shelter integration's `.mdt-wrap` class as a fallback) and unwraps every
+ * `.mdt-src` span — moving its child nodes back into the parent at the span's
+ * position, then removing the span — so the DOM ends up equivalent to the original.
+ */
+export function restoreReplacedTables(root: ParentNode): void {
+  // Remove inserted tables first; they sit next to (not inside) the `.mdt-src`
+  // spans, so order relative to the unwrap step below doesn't matter for correctness.
+  root.querySelectorAll(MDT_INSERTED_SELECTOR).forEach((el) => el.remove());
+
+  root.querySelectorAll(`.${MDT_SRC_CLASS}`).forEach((span) => {
+    const parent = span.parentNode;
+    if (!parent) return;
+    while (span.firstChild) parent.insertBefore(span.firstChild, span);
+    parent.removeChild(span);
+  });
 }

@@ -9,6 +9,7 @@ import {
   formatInline,
   parseTables,
   replaceTablesInContent,
+  restoreReplacedTables,
   type TableBlock,
 } from "./core";
 
@@ -29,6 +30,7 @@ const CSS = `
 .mdt-table th{background:var(--background-secondary,#2b2d31);font-weight:600;text-align:left}
 .mdt-table tbody tr:nth-child(even){background:var(--background-secondary-alt,rgba(255,255,255,.03))}
 .mdt-table code{background:var(--background-secondary-alt,rgba(255,255,255,.08));padding:0 4px;border-radius:3px;font-family:var(--font-code,monospace)}
+.mdt-src{display:none}
 `;
 
 function applyAlign(el: HTMLElement, a: Align) {
@@ -69,6 +71,14 @@ function renderTable(block: TableBlock): HTMLElement {
 }
 
 function processRow(row: HTMLElement) {
+  // The reprocessing guard lives on the CONTENT node, not the row: Discord replaces
+  // `[id^="message-content-"]` wholesale when a message is edited, so a marker set on
+  // the row would survive the edit and permanently block re-rendering. Marking the
+  // content node instead means an edit naturally re-processes (FINDING A).
+  const contentEl = row.querySelector('[id^="message-content-"]') as HTMLElement | null;
+  if (!contentEl) return;
+  if (contentEl.dataset.mdTables === "1") return;
+
   const msg = reactFiberWalker(getFiber(row), "message", true)?.memoizedProps?.message as any;
   const content: string | undefined = msg?.content;
   if (!content || !content.includes("|")) return;
@@ -76,9 +86,7 @@ function processRow(row: HTMLElement) {
   const blocks = parseTables(content);
   if (!blocks.length) return;
 
-  const contentEl = row.querySelector('[id^="message-content-"]') as HTMLElement | null;
-  if (!contentEl) return;
-
+  contentEl.dataset.mdTables = "1";
   replaceTablesInContent(contentEl, content, blocks, renderTable);
 }
 
@@ -102,11 +110,12 @@ function handleDispatch(payload: any) {
 
   // Process every row matched during this observation window — a single dispatch
   // (e.g. LOAD_MESSAGES_SUCCESS after scrolling history) can mount many rows at
-  // once, and `observeDom` invokes this callback once per matching element. The
-  // dataset guard, set immediately, prevents any row from ever being reprocessed
-  // (FINDING 2 — do not stop the observer after only the first match).
-  const unobs = observeDom('[id^="chat-messages-"]:not([data-md-tables])', (e: HTMLElement) => {
-    e.dataset.mdTables = "1";
+  // once, and `observeDom` invokes this callback once per matching element (FINDING
+  // 2 — do not stop the observer after only the first match). The selector has no
+  // `:not([data-md-tables])` filter: dedup happens at the content level inside
+  // `processRow`, so rows stay revisitable — which matters because Discord swaps a
+  // row's content node (not the row itself) on edit (FINDING A).
+  const unobs = observeDom('[id^="chat-messages-"]', (e: HTMLElement) => {
     try {
       processRow(e);
     } catch (err) {
@@ -134,6 +143,12 @@ export function onLoad() {
 export function onUnload() {
   for (const t of TRIGGERS) dispatcher.unsubscribe(t, handleDispatch);
   for (const stop of [...activeObservers]) stop();
-  document.querySelectorAll(".mdt-wrap").forEach((n) => n.remove());
+  // Non-destructive replace (FINDING B) means undo is a real restore, not just a
+  // removal of inserted nodes: `restoreReplacedTables` also unwraps `.mdt-src` spans
+  // so the original message text reappears instead of leaving a blank gap.
+  restoreReplacedTables(document);
+  document.querySelectorAll("[data-md-tables]").forEach((el) => {
+    delete (el as HTMLElement).dataset.mdTables;
+  });
   removeCss?.();
 }
