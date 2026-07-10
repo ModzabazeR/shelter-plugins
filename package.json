@@ -1,0 +1,19 @@
+{
+  "name": "shelter-plugins",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "build": "lune ci",
+    "ssg": "lune ssg ci",
+    "test": "vitest run --passWithNoTests",
+    "test:watch": "vitest"
+  },
+  "devDependencies": {
+    "@uwu/lune": "^1.6.2",
+    "@uwu/shelter-defs": "^1.4.1",
+    "solid-js": "1.6.16",
+    "typescript": "^5",
+    "vitest": "^2",
+    "jsdom": "^25"
+  }
+}
