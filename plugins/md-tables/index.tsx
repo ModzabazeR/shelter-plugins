@@ -4,7 +4,13 @@
  * SPDX-License-Identifier: GPL-3.0-or-later
  */
 
-import { type Align, formatInline, parseTables, type TableBlock } from "./core";
+import {
+  type Align,
+  formatInline,
+  parseTables,
+  replaceTablesInContent,
+  type TableBlock,
+} from "./core";
 
 const {
   flux: {
@@ -62,73 +68,6 @@ function renderTable(block: TableBlock): HTMLElement {
   return wrap;
 }
 
-interface Line {
-  text: string;
-  nodes: Node[];
-}
-
-// Walk a message-content element into logical lines, tracking the DOM nodes that
-// compose each line. Handles both <br>-separated and \n-in-text-node line breaks.
-function collectLines(root: HTMLElement): Line[] {
-  const lines: Line[] = [];
-  let cur: Line = { text: "", nodes: [] };
-  const push = () => {
-    lines.push(cur);
-    cur = { text: "", nodes: [] };
-  };
-  for (const child of Array.from(root.childNodes)) {
-    if (child.nodeType === Node.TEXT_NODE) {
-      const parts = (child.textContent ?? "").split("\n");
-      parts.forEach((p, idx) => {
-        if (idx > 0) push();
-        cur.text += p;
-        if (!cur.nodes.includes(child)) cur.nodes.push(child);
-      });
-    } else if (child.nodeName === "BR") {
-      cur.nodes.push(child);
-      push();
-    } else {
-      cur.nodes.push(child);
-      cur.text += (child as HTMLElement).textContent ?? "";
-    }
-  }
-  lines.push(cur);
-  return lines;
-}
-
-function matchRange(lines: Line[], blockLines: string[]): Node[] | null {
-  for (let s = 0; s + blockLines.length <= lines.length; s++) {
-    let ok = true;
-    for (let k = 0; k < blockLines.length; k++) {
-      if (lines[s + k].text.trim() !== blockLines[k]) {
-        ok = false;
-        break;
-      }
-    }
-    if (!ok) continue;
-    const nodes: Node[] = [];
-    for (let k = 0; k < blockLines.length; k++) {
-      for (const n of lines[s + k].nodes) if (!nodes.includes(n)) nodes.push(n);
-    }
-    return nodes;
-  }
-  return null;
-}
-
-function replaceNodes(nodes: Node[], replacement: HTMLElement) {
-  const first = nodes[0];
-  const parent = first?.parentNode;
-  if (!parent) return;
-  parent.insertBefore(replacement, first);
-  for (const n of nodes) {
-    try {
-      n.parentNode?.removeChild(n);
-    } catch {
-      /* ignore */
-    }
-  }
-}
-
 function processRow(row: HTMLElement) {
   const msg = reactFiberWalker(getFiber(row), "message", true)?.memoizedProps?.message as any;
   const content: string | undefined = msg?.content;
@@ -140,15 +79,7 @@ function processRow(row: HTMLElement) {
   const contentEl = row.querySelector('[id^="message-content-"]') as HTMLElement | null;
   if (!contentEl) return;
 
-  const contentLines = content.split("\n");
-  const lines = collectLines(contentEl);
-
-  // Replace from the last block to the first so earlier node references stay valid.
-  for (const block of [...blocks].reverse()) {
-    const blockLines = contentLines.slice(block.startLine, block.endLine + 1).map((s) => s.trim());
-    const range = matchRange(lines, blockLines);
-    if (range) replaceNodes(range, renderTable(block));
-  }
+  replaceTablesInContent(contentEl, content, blocks, renderTable);
 }
 
 const TRIGGERS = [
@@ -158,6 +89,10 @@ const TRIGGERS = [
   "UPDATE_CHANNEL_DIMENSIONS",
 ];
 
+// In-flight observer stoppers, tracked so onUnload can halt any that are still
+// running when the plugin is unloaded (FINDING 4).
+const activeObservers = new Set<() => void>();
+
 function handleDispatch(payload: any) {
   if (
     (payload.type === "MESSAGE_CREATE" || payload.type === "MESSAGE_UPDATE") &&
@@ -165,16 +100,28 @@ function handleDispatch(payload: any) {
   )
     return;
 
+  // Process every row matched during this observation window — a single dispatch
+  // (e.g. LOAD_MESSAGES_SUCCESS after scrolling history) can mount many rows at
+  // once, and `observeDom` invokes this callback once per matching element. The
+  // dataset guard, set immediately, prevents any row from ever being reprocessed
+  // (FINDING 2 — do not stop the observer after only the first match).
   const unobs = observeDom('[id^="chat-messages-"]:not([data-md-tables])', (e: HTMLElement) => {
     e.dataset.mdTables = "1";
-    unobs();
     try {
       processRow(e);
     } catch (err) {
       console.error("[md-tables] processRow failed", err);
     }
   });
-  setTimeout(unobs, 1500);
+
+  let timeoutId: ReturnType<typeof setTimeout> | undefined;
+  const stop = () => {
+    activeObservers.delete(stop);
+    if (timeoutId !== undefined) clearTimeout(timeoutId);
+    unobs();
+  };
+  activeObservers.add(stop);
+  timeoutId = setTimeout(stop, 1500);
 }
 
 let removeCss: (() => void) | undefined;
@@ -186,6 +133,7 @@ export function onLoad() {
 
 export function onUnload() {
   for (const t of TRIGGERS) dispatcher.unsubscribe(t, handleDispatch);
+  for (const stop of [...activeObservers]) stop();
   document.querySelectorAll(".mdt-wrap").forEach((n) => n.remove());
   removeCss?.();
 }
