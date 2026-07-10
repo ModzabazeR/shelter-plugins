@@ -5,6 +5,7 @@
   "scripts": {
     "build": "lune ci",
     "ssg": "lune ssg ci",
+    "typecheck": "tsc --noEmit",
     "test": "vitest run --passWithNoTests",
     "test:watch": "vitest"
   },

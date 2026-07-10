@@ -122,7 +122,9 @@ function handleDispatch(payload: any) {
   // `:not([data-md-tables])` filter: dedup happens at the content level inside
   // `processRow`, so rows stay revisitable — which matters because Discord swaps a
   // row's content node (not the row itself) on edit (FINDING A).
-  const unobs = observeDom('[id^="chat-messages-"]', (e: HTMLElement) => {
+  // observeDom hands back HTMLElement | SVGElement; message rows are always HTML.
+  const unobs = observeDom('[id^="chat-messages-"]', (e) => {
+    if (!(e instanceof HTMLElement)) return;
     try {
       processRow(e);
     } catch (err) {
