@@ -3,7 +3,7 @@
 "use strict";
 
 //#region plugins/md-tables/core/parseTables.ts
-const DELIM_CELL = /^:?-+:?$/;
+const DELIM_CELL$1 = /^:?-+:?$/;
 function splitRow(line) {
 	const cells = [];
 	let cur = "";
@@ -29,7 +29,7 @@ function splitRow(line) {
 function isDelimiterLine(line) {
 	if (!line.includes("-")) return false;
 	const cells = splitRow(line);
-	return cells.length > 0 && cells.every((c) => DELIM_CELL.test(c));
+	return cells.length > 0 && cells.every((c) => DELIM_CELL$1.test(c));
 }
 function parseAligns(line) {
 	return splitRow(line).map((c) => {
@@ -41,7 +41,7 @@ function parseAligns(line) {
 		return null;
 	});
 }
-function fit(cells, n) {
+function fit$1(cells, n) {
 	const out = cells.slice(0, n);
 	while (out.length < n) out.push("");
 	return out;
@@ -62,11 +62,11 @@ function parseTables(text) {
 				i++;
 				continue;
 			}
-			const headers = fit(headerCells, ncol);
+			const headers = fit$1(headerCells, ncol);
 			const rows = [];
 			let j = i + 2;
 			while (j < lines.length && lines[j].trim() !== "" && lines[j].includes("|")) {
-				rows.push(fit(splitRow(lines[j]), ncol));
+				rows.push(fit$1(splitRow(lines[j]), ncol));
 				j++;
 			}
 			blocks.push({
@@ -80,66 +80,6 @@ function parseTables(text) {
 		} else i++;
 	}
 	return blocks;
-}
-
-//#endregion
-//#region plugins/md-tables/core/formatInline.ts
-function formatInline(cell, doc = document) {
-	return parseSegment(cell, doc);
-}
-function parseSegment(text, doc) {
-	const nodes = [];
-	let buf = "";
-	let i = 0;
-	const flush = () => {
-		if (buf) {
-			nodes.push(doc.createTextNode(buf));
-			buf = "";
-		}
-	};
-	while (i < text.length) {
-		const rest = text.slice(i);
-		let m = /^`([^`]+)`/.exec(rest);
-		if (m) {
-			flush();
-			const el = doc.createElement("code");
-			el.textContent = m[1];
-			nodes.push(el);
-			i += m[0].length;
-			continue;
-		}
-		m = /^(\*\*|__)(.+?)\1/.exec(rest);
-		if (m) {
-			flush();
-			const el = doc.createElement("strong");
-			el.append(...parseSegment(m[2], doc));
-			nodes.push(el);
-			i += m[0].length;
-			continue;
-		}
-		m = /^~~(.+?)~~/.exec(rest);
-		if (m) {
-			flush();
-			const el = doc.createElement("s");
-			el.append(...parseSegment(m[1], doc));
-			nodes.push(el);
-			i += m[0].length;
-			continue;
-		}
-		m = /^(\*|_)(?!\s)(.+?)(?<!\s)\1/.exec(rest);
-		if (m) {
-			flush();
-			const el = doc.createElement("em");
-			el.append(...parseSegment(m[2], doc));
-			nodes.push(el);
-			i += m[0].length;
-			continue;
-		}
-		buf += text[i];
-		i++;
-	}
-	flush();
-	return nodes;
 }
 
 //#endregion
@@ -168,6 +108,7 @@ const BLOCK_TAGS = new Set([
 const MDT_INSERTED_ATTR = "data-mdt-inserted";
 const MDT_INSERTED_SELECTOR = `[${MDT_INSERTED_ATTR}], .mdt-wrap`;
 const MDT_SRC_CLASS = "mdt-src";
+const DELIM_CELL = /^:?-+:?$/;
 function isBlock(n) {
 	return n.nodeType === Node.ELEMENT_NODE && BLOCK_TAGS.has(n.nodeName);
 }
@@ -198,13 +139,11 @@ function locate(segs, char) {
 		offset: char - s.start
 	};
 	let best;
-	for (const s of segs) if (s.start + s.len <= char) best = s;
-else if (s.start <= char) best = s;
-	if (best && char >= best.start && char <= best.start + best.len) return {
+	for (const s of segs) if (s.start <= char && char <= s.start + s.len) best = s;
+	return best ? {
 		node: best.node,
 		offset: char - best.start
-	};
-	return null;
+	} : null;
 }
 function blockCharRange(runLines, block) {
 	let start = 0;
@@ -216,7 +155,140 @@ function blockCharRange(runLines, block) {
 	}
 	return [start, end];
 }
-function renderTablesInContent(contentEl, makeTable) {
+function isTransparentWrapper(node) {
+	if (node.nodeType !== Node.ELEMENT_NODE || node.nodeName !== "SPAN") return false;
+	const el = node;
+	if (el.className === "") return true;
+	const t = el.textContent ?? "";
+	return t.includes("|") || t.includes("\n");
+}
+function tokenize(frag) {
+	const toks = [];
+	const visit = (node) => {
+		for (const child of Array.from(node.childNodes)) if (child.nodeType === Node.TEXT_NODE) {
+			let buf = "";
+			const flush = () => {
+				if (buf) {
+					toks.push({
+						k: "text",
+						text: buf
+					});
+					buf = "";
+				}
+			};
+			for (const ch of child.data) if (ch === "|") {
+				flush();
+				toks.push({ k: "cell" });
+			} else if (ch === "\n") {
+				flush();
+				toks.push({ k: "row" });
+			} else buf += ch;
+			flush();
+		} else if (child.nodeName === "BR") toks.push({ k: "row" });
+else if (isTransparentWrapper(child)) visit(child);
+else toks.push({
+			k: "el",
+			node: child
+		});
+	};
+	visit(frag);
+	return toks;
+}
+function tokensToRows(toks, doc) {
+	const rows = [];
+	let row = [];
+	let cell = [];
+	const endCell = () => {
+		row.push(cell);
+		cell = [];
+	};
+	const endRow = () => {
+		endCell();
+		rows.push(row);
+		row = [];
+	};
+	for (const t of toks) if (t.k === "cell") endCell();
+else if (t.k === "row") endRow();
+else if (t.k === "text") cell.push(doc.createTextNode(t.text));
+else cell.push(t.node.cloneNode(true));
+	if (cell.length || row.some((c) => c.length)) endRow();
+	return rows;
+}
+function isWs(node) {
+	return node.nodeType === Node.TEXT_NODE && /^\s*$/.test(node.data);
+}
+function trimCell(nodes) {
+	const out = nodes.slice();
+	while (out.length && isWs(out[0])) out.shift();
+	while (out.length && isWs(out[out.length - 1])) out.pop();
+	if (out.length && out[0].nodeType === Node.TEXT_NODE) out[0].data = out[0].data.replace(/^\s+/, "");
+	const last = out[out.length - 1];
+	if (out.length && last.nodeType === Node.TEXT_NODE) last.data = last.data.replace(/\s+$/, "");
+	return out;
+}
+function cellText(nodes) {
+	return nodes.map((n) => n.textContent ?? "").join("").trim();
+}
+function normalizeRow(cells) {
+	const trimmed = cells.map(trimCell);
+	if (trimmed.length && cellText(trimmed[0]).length === 0) trimmed.shift();
+	if (trimmed.length && cellText(trimmed[trimmed.length - 1]).length === 0) trimmed.pop();
+	return trimmed;
+}
+function alignsFromRow(cells) {
+	return cells.map((nodes) => {
+		const s = cellText(nodes);
+		const l = s.startsWith(":");
+		const r = s.endsWith(":");
+		return l && r ? "center" : r ? "right" : l ? "left" : null;
+	});
+}
+function fit(arr, n, empty) {
+	const out = arr.slice(0, n);
+	while (out.length < n) out.push(empty());
+	return out;
+}
+function applyAlign(el, a) {
+	if (a) el.style.textAlign = a;
+}
+function buildTable(frag, doc) {
+	const rawRows = tokensToRows(tokenize(frag), doc).map(normalizeRow);
+	const d = rawRows.findIndex((cells) => cells.length > 0 && cells.every((c) => DELIM_CELL.test(cellText(c))));
+	if (d < 1) return null;
+	const header = rawRows[d - 1];
+	const aligns = alignsFromRow(rawRows[d]);
+	const ncol = aligns.length;
+	const body = rawRows.slice(d + 1);
+	const wrap = doc.createElement("div");
+	wrap.className = "mdt-wrap";
+	const table = doc.createElement("table");
+	table.className = "mdt-table";
+	const thead = doc.createElement("thead");
+	const htr = doc.createElement("tr");
+	fit(header, ncol, () => []).forEach((nodes, c) => {
+		const th = doc.createElement("th");
+		applyAlign(th, aligns[c]);
+		th.append(...nodes);
+		htr.append(th);
+	});
+	thead.append(htr);
+	table.append(thead);
+	const tbody = doc.createElement("tbody");
+	for (const rowCells of body) {
+		const tr = doc.createElement("tr");
+		fit(rowCells, ncol, () => []).forEach((nodes, c) => {
+			const td = doc.createElement("td");
+			applyAlign(td, aligns[c]);
+			td.append(...nodes);
+			tr.append(td);
+		});
+		tbody.append(tr);
+	}
+	table.append(tbody);
+	wrap.append(table);
+	return wrap;
+}
+function renderTablesInContent(contentEl) {
 	const doc = contentEl.ownerDocument ?? document;
 	const runs = [];
 	let cur = [];
@@ -245,11 +317,15 @@ function renderTablesInContent(contentEl, makeTable) {
 				continue;
 			}
 			const frag = range.extractContents();
+			const table = buildTable(frag, doc);
+			if (!table) {
+				range.insertNode(frag);
+				continue;
+			}
 			const holder = doc.createElement("span");
 			holder.className = MDT_SRC_CLASS;
 			holder.style.display = "none";
 			holder.appendChild(frag);
-			const table = makeTable(block);
 			table.setAttribute(MDT_INSERTED_ATTR, "1");
 			range.insertNode(holder);
 			holder.parentNode?.insertBefore(table, holder.nextSibling);
@@ -280,45 +356,12 @@ const CSS = `
 .mdt-table code{background:var(--background-secondary-alt,rgba(255,255,255,.08));padding:0 4px;border-radius:3px;font-family:var(--font-code,monospace)}
 .mdt-src{display:none}
 `;
-function applyAlign(el, a) {
-	if (a) el.style.textAlign = a;
-}
-function renderTable(block) {
-	const wrap = document.createElement("div");
-	wrap.className = "mdt-wrap";
-	const table = document.createElement("table");
-	table.className = "mdt-table";
-	const thead = document.createElement("thead");
-	const htr = document.createElement("tr");
-	block.headers.forEach((h, c) => {
-		const th = document.createElement("th");
-		applyAlign(th, block.aligns[c]);
-		th.append(...formatInline(h));
-		htr.append(th);
-	});
-	thead.append(htr);
-	table.append(thead);
-	const tbody = document.createElement("tbody");
-	for (const row of block.rows) {
-		const tr = document.createElement("tr");
-		row.forEach((cell, c) => {
-			const td = document.createElement("td");
-			applyAlign(td, block.aligns[c]);
-			td.append(...formatInline(cell));
-			tr.append(td);
-		});
-		tbody.append(tr);
-	}
-	table.append(tbody);
-	wrap.append(table);
-	return wrap;
-}
 function processRow(row) {
 	const contentEl = row.querySelector("[id^=\"message-content-\"]");
 	if (!contentEl) return;
 	if (contentEl.dataset.mdTables === "1") return;
 	if (!(contentEl.textContent ?? "").includes("|")) return;
-	const rendered = renderTablesInContent(contentEl, renderTable);
+	const rendered = renderTablesInContent(contentEl);
 	if (rendered > 0) contentEl.dataset.mdTables = "1";
 }
 const TRIGGERS = [
