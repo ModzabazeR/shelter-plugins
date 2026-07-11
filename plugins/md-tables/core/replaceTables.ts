@@ -6,29 +6,29 @@
  * inside table cells (e.g. `**bold**` becomes a `<strong>`), so the raw content
  * string does not match the rendered text, and a message's lines are split across
  * `<span>`/`<strong>`/... siblings with the "\n"s living inside those spans. We
- * therefore reconstruct each inline run's rendered text, detect GFM tables in it,
- * and carve the table's exact character span out of the DOM with a `Range` — which
- * transparently splits nested Text nodes and partially-selected element ancestors.
+ * reconstruct each inline run's rendered text, detect GFM tables in it, and carve the
+ * table's exact character span out of the DOM with a `Range` — which transparently
+ * splits nested Text nodes and partially-selected element ancestors.
  *
- * The replacement is NON-DESTRUCTIVE: the carved-out rendered nodes are not thrown
- * away. They are stashed in a hidden `<span class="mdt-src">` holder placed where the
- * table now sits, and `restoreReplacedTables()` puts them back exactly (removing the
- * inserted table and unwrapping the holder) so `onUnload` never leaves a blank gap.
+ * Cell content is preserved with formatting: the carved-out fragment is tokenized by
+ * `|` / `\n`, and each cell's rendered nodes (text, `<strong>`, `<code>`, mention/emoji
+ * spans, links, ...) are CLONED into the table cell. Cloning (not moving) leaves the
+ * pristine originals available for restore.
  *
- * This module is pure DOM: it never touches the `shelter` global. The caller supplies
- * `makeTable(block)` to build the visible table from a parsed block.
+ * The replacement is NON-DESTRUCTIVE: the carved-out originals are stashed in a hidden
+ * `<span class="mdt-src">` holder placed where the table now sits, and
+ * `restoreReplacedTables()` puts them back exactly (removing the inserted table and
+ * unwrapping the holder) so `onUnload` never leaves a blank gap.
  *
- * KNOWN LIMITATION (v0.1): cells render as plain text. Inline formatting Discord had
- * rendered inside a cell (bold/italic/code/mentions/emoji) is flattened to text,
- * because detection reads the already-rendered (marker-free) text. Preserving in-cell
- * formatting by moving the rendered nodes into the cells is a follow-up.
+ * This module is pure DOM: it never touches the `shelter` global.
+ *
+ * Known limitations: a cloned interactive node (e.g. a mention) renders styled but is
+ * not clickable; a literal `|` inside an inline element (e.g. `**a|b**`) or an escaped
+ * `\|` is indistinguishable from a real delimiter once rendered, so it splits a cell.
  */
 
-import { parseTables, type TableBlock } from "./parseTables";
+import { type Align, parseTables, type TableBlock } from "./parseTables";
 
-// Block-level tags break an inline run: a GFM table never spans across one, and their
-// text must not be glued to adjacent lines. Everything else at the top level of a
-// message-content element (#text, SPAN, STRONG, EM, CODE, A, IMG, BR, ...) is inline.
 const BLOCK_TAGS = new Set([
   "H1", "H2", "H3", "H4", "H5", "H6",
   "UL", "OL", "LI", "P", "DIV", "BLOCKQUOTE", "PRE", "HR",
@@ -36,25 +36,22 @@ const BLOCK_TAGS = new Set([
 ]);
 
 const MDT_INSERTED_ATTR = "data-mdt-inserted";
-// `.mdt-wrap` is the Shelter integration's own wrapper class (index.tsx). Matching it
-// too, alongside the internal attribute, is defense in depth on restore.
 const MDT_INSERTED_SELECTOR = `[${MDT_INSERTED_ATTR}], .mdt-wrap`;
 const MDT_SRC_CLASS = "mdt-src";
+const DELIM_CELL = /^:?-+:?$/;
 
 function isBlock(n: Node): boolean {
   return n.nodeType === Node.ELEMENT_NODE && BLOCK_TAGS.has(n.nodeName);
 }
 
-// Map from a character offset in the reconstructed run text to a descendant Text node.
+// ---- run text reconstruction + char->node mapping ------------------------------
+
 interface TextSeg {
   node: Text;
-  start: number; // char offset of this node's text within the run string
+  start: number;
   len: number;
 }
 
-// Reconstruct an inline run's rendered text and record where each descendant Text
-// node sits within it, so a character span can be turned into a DOM Range. A <br>
-// contributes a "\n" with no node (line boundaries never become Range edges).
 function buildRunText(run: Node[]): { text: string; segs: TextSeg[] } {
   let text = "";
   const segs: TextSeg[] = [];
@@ -73,58 +70,221 @@ function buildRunText(run: Node[]): { text: string; segs: TextSeg[] } {
   return { text, segs };
 }
 
-// Resolve a character offset to (Text node, offset within it). Prefers a position at
-// the *start* of a segment over the end of the previous one, so a Range endpoint lands
-// on a real character rather than a zero-length boundary where possible.
 function locate(segs: TextSeg[], char: number): { node: Text; offset: number } | null {
   for (const s of segs) {
     if (char >= s.start && char < s.start + s.len) {
       return { node: s.node, offset: char - s.start };
     }
   }
-  // End-of-run (or a boundary that coincides with a segment end): clamp to the last
-  // segment that ends at or before `char`.
   let best: TextSeg | undefined;
   for (const s of segs) {
-    if (s.start + s.len <= char) best = s;
-    else if (s.start <= char) best = s;
+    if (s.start <= char && char <= s.start + s.len) best = s;
   }
-  if (best && char >= best.start && char <= best.start + best.len) {
-    return { node: best.node, offset: char - best.start };
-  }
-  return null;
+  return best ? { node: best.node, offset: char - best.start } : null;
 }
 
-// Character span [start, end) covered by a table block within the run text.
 function blockCharRange(runLines: string[], block: TableBlock): [number, number] {
   let start = 0;
   for (let i = 0; i < block.startLine; i++) start += runLines[i].length + 1;
   let end = start;
   for (let i = block.startLine; i <= block.endLine; i++) {
     end += runLines[i].length;
-    if (i < block.endLine) end += 1; // the "\n" between rows
+    if (i < block.endLine) end += 1;
   }
   return [start, end];
 }
 
+// ---- fragment -> table, preserving cell formatting -----------------------------
+
+// A SPAN is a transparent text-run wrapper (descend into it) when it carries table
+// delimiter characters; a class-bearing span with none (a mention/emoji/spoiler) is
+// preserved atomically so its styling clones intact.
+function isTransparentWrapper(node: Node): boolean {
+  if (node.nodeType !== Node.ELEMENT_NODE || node.nodeName !== "SPAN") return false;
+  const el = node as HTMLElement;
+  if (el.className === "") return true;
+  const t = el.textContent ?? "";
+  return t.includes("|") || t.includes("\n");
+}
+
+type Tok =
+  | { k: "text"; text: string }
+  | { k: "el"; node: Node }
+  | { k: "cell" }
+  | { k: "row" };
+
+function tokenize(frag: DocumentFragment): Tok[] {
+  const toks: Tok[] = [];
+  const visit = (node: Node) => {
+    for (const child of Array.from(node.childNodes)) {
+      if (child.nodeType === Node.TEXT_NODE) {
+        let buf = "";
+        const flush = () => {
+          if (buf) {
+            toks.push({ k: "text", text: buf });
+            buf = "";
+          }
+        };
+        for (const ch of (child as Text).data) {
+          if (ch === "|") {
+            flush();
+            toks.push({ k: "cell" });
+          } else if (ch === "\n") {
+            flush();
+            toks.push({ k: "row" });
+          } else {
+            buf += ch;
+          }
+        }
+        flush();
+      } else if (child.nodeName === "BR") {
+        toks.push({ k: "row" });
+      } else if (isTransparentWrapper(child)) {
+        visit(child);
+      } else {
+        toks.push({ k: "el", node: child });
+      }
+    }
+  };
+  visit(frag);
+  return toks;
+}
+
+// Group tokens into rows -> cells -> cloned nodes.
+function tokensToRows(toks: Tok[], doc: Document): Node[][][] {
+  const rows: Node[][][] = [];
+  let row: Node[][] = [];
+  let cell: Node[] = [];
+  const endCell = () => {
+    row.push(cell);
+    cell = [];
+  };
+  const endRow = () => {
+    endCell();
+    rows.push(row);
+    row = [];
+  };
+  for (const t of toks) {
+    if (t.k === "cell") endCell();
+    else if (t.k === "row") endRow();
+    else if (t.k === "text") cell.push(doc.createTextNode(t.text));
+    else cell.push(t.node.cloneNode(true));
+  }
+  // Emit the final row only if it holds anything (the carved range has no trailing "\n").
+  if (cell.length || row.some((c) => c.length)) endRow();
+  return rows;
+}
+
+function isWs(node: Node): boolean {
+  return node.nodeType === Node.TEXT_NODE && /^\s*$/.test((node as Text).data);
+}
+
+// Trim whitespace at a cell's edges (drop ws-only edge nodes, trim the first/last text).
+function trimCell(nodes: Node[]): Node[] {
+  const out = nodes.slice();
+  while (out.length && isWs(out[0])) out.shift();
+  while (out.length && isWs(out[out.length - 1])) out.pop();
+  if (out.length && out[0].nodeType === Node.TEXT_NODE) {
+    (out[0] as Text).data = (out[0] as Text).data.replace(/^\s+/, "");
+  }
+  const last = out[out.length - 1];
+  if (out.length && last.nodeType === Node.TEXT_NODE) {
+    (last as Text).data = (last as Text).data.replace(/\s+$/, "");
+  }
+  return out;
+}
+
+function cellText(nodes: Node[]): string {
+  return nodes.map((n) => n.textContent ?? "").join("").trim();
+}
+
+// Drop the outer empty cells produced by leading/trailing pipes, then trim each cell.
+function normalizeRow(cells: Node[][]): Node[][] {
+  const trimmed = cells.map(trimCell);
+  if (trimmed.length && cellText(trimmed[0]).length === 0) trimmed.shift();
+  if (trimmed.length && cellText(trimmed[trimmed.length - 1]).length === 0) trimmed.pop();
+  return trimmed;
+}
+
+function alignsFromRow(cells: Node[][]): Align[] {
+  return cells.map((nodes) => {
+    const s = cellText(nodes);
+    const l = s.startsWith(":");
+    const r = s.endsWith(":");
+    return l && r ? "center" : r ? "right" : l ? "left" : null;
+  });
+}
+
+function fit<T>(arr: T[], n: number, empty: () => T): T[] {
+  const out = arr.slice(0, n);
+  while (out.length < n) out.push(empty());
+  return out;
+}
+
+function applyAlign(el: HTMLElement, a: Align): void {
+  if (a) el.style.textAlign = a;
+}
+
+// Build the styled <table> from the carved fragment. Returns null if the fragment
+// doesn't actually resolve to a header + delimiter + body (defensive; parseTables
+// already vetted the run, but the tokenized view must agree).
+function buildTable(frag: DocumentFragment, doc: Document): HTMLElement | null {
+  const rawRows = tokensToRows(tokenize(frag), doc).map(normalizeRow);
+  // Locate the delimiter row (cells all `:?-+:?`).
+  const d = rawRows.findIndex(
+    (cells) => cells.length > 0 && cells.every((c) => DELIM_CELL.test(cellText(c))),
+  );
+  if (d < 1) return null;
+  const header = rawRows[d - 1];
+  const aligns = alignsFromRow(rawRows[d]);
+  const ncol = aligns.length;
+  const body = rawRows.slice(d + 1);
+
+  const wrap = doc.createElement("div");
+  wrap.className = "mdt-wrap";
+  const table = doc.createElement("table");
+  table.className = "mdt-table";
+
+  const thead = doc.createElement("thead");
+  const htr = doc.createElement("tr");
+  fit(header, ncol, () => [] as Node[]).forEach((nodes, c) => {
+    const th = doc.createElement("th");
+    applyAlign(th, aligns[c]);
+    th.append(...nodes);
+    htr.append(th);
+  });
+  thead.append(htr);
+  table.append(thead);
+
+  const tbody = doc.createElement("tbody");
+  for (const rowCells of body) {
+    const tr = doc.createElement("tr");
+    fit(rowCells, ncol, () => [] as Node[]).forEach((nodes, c) => {
+      const td = doc.createElement("td");
+      applyAlign(td, aligns[c]);
+      td.append(...nodes);
+      tr.append(td);
+    });
+    tbody.append(tr);
+  }
+  table.append(tbody);
+  wrap.append(table);
+  return wrap;
+}
+
+// ---- public API ----------------------------------------------------------------
+
 /**
  * Detect every GFM table in `contentEl`'s rendered content and replace each in place
- * with `makeTable(block)`. Detection reads the rendered DOM text (per inline run,
- * split on block-level elements), so tables whose cells Discord already formatted are
- * still found. Each table's exact character span is carved out with a Range, stashed
- * in a hidden `.mdt-src` holder (so `restoreReplacedTables` can bring it back), and the
- * table is inserted where it was.
- *
- * Returns the number of tables rendered. 0 means nothing was found and `contentEl` is
- * untouched — callers use this to decide whether to mark the element processed.
+ * with a styled `<table>` whose cells preserve Discord's own rendered formatting.
+ * Each table's exact character span is carved out with a Range, stashed in a hidden
+ * `.mdt-src` holder (so `restoreReplacedTables` can bring it back), and the table
+ * inserted where it was. Returns the number of tables rendered; 0 leaves `contentEl`
+ * untouched.
  */
-export function renderTablesInContent(
-  contentEl: HTMLElement,
-  makeTable: (block: TableBlock) => HTMLElement,
-): number {
+export function renderTablesInContent(contentEl: HTMLElement): number {
   const doc = contentEl.ownerDocument ?? document;
 
-  // Partition top-level children into inline runs separated by block elements.
   const runs: Node[][] = [];
   let cur: Node[] = [];
   for (const child of Array.from(contentEl.childNodes)) {
@@ -146,8 +306,6 @@ export function renderTablesInContent(
     if (!blocks.length) continue;
 
     const runLines = text.split("\n");
-    // Apply last-to-first: extracting a later block only splits nodes at/after its own
-    // start, so earlier blocks' segment offsets stay valid.
     for (const block of [...blocks].reverse()) {
       const [sc, ec] = blockCharRange(runLines, block);
       const startPos = locate(segs, sc);
@@ -163,17 +321,20 @@ export function renderTablesInContent(
       }
 
       const frag = range.extractContents();
+      const table = buildTable(frag, doc);
+      if (!table) {
+        // Couldn't resolve the fragment into a table — put the carved nodes back and
+        // skip, leaving the message intact rather than dropping content.
+        range.insertNode(frag);
+        continue;
+      }
 
       const holder = doc.createElement("span");
       holder.className = MDT_SRC_CLASS;
       holder.style.display = "none";
       holder.appendChild(frag);
 
-      const table = makeTable(block);
       table.setAttribute(MDT_INSERTED_ATTR, "1");
-
-      // The range has collapsed to the extraction point; drop the holder there, then
-      // the table right after it.
       range.insertNode(holder);
       holder.parentNode?.insertBefore(table, holder.nextSibling);
       count++;
@@ -189,7 +350,6 @@ export function renderTablesInContent(
  */
 export function restoreReplacedTables(root: ParentNode): void {
   root.querySelectorAll(MDT_INSERTED_SELECTOR).forEach((el) => el.remove());
-
   root.querySelectorAll(`.${MDT_SRC_CLASS}`).forEach((holder) => {
     const parent = holder.parentNode;
     if (!parent) return;

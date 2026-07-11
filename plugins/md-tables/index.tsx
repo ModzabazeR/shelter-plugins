@@ -4,13 +4,7 @@
  * SPDX-License-Identifier: GPL-3.0-or-later
  */
 
-import {
-  type Align,
-  formatInline,
-  renderTablesInContent,
-  restoreReplacedTables,
-  type TableBlock,
-} from "./core";
+import { renderTablesInContent, restoreReplacedTables } from "./core";
 
 const {
   flux: {
@@ -31,43 +25,6 @@ const CSS = `
 .mdt-src{display:none}
 `;
 
-function applyAlign(el: HTMLElement, a: Align) {
-  if (a) el.style.textAlign = a;
-}
-
-function renderTable(block: TableBlock): HTMLElement {
-  const wrap = document.createElement("div");
-  wrap.className = "mdt-wrap";
-  const table = document.createElement("table");
-  table.className = "mdt-table";
-
-  const thead = document.createElement("thead");
-  const htr = document.createElement("tr");
-  block.headers.forEach((h, c) => {
-    const th = document.createElement("th");
-    applyAlign(th, block.aligns[c]);
-    th.append(...formatInline(h));
-    htr.append(th);
-  });
-  thead.append(htr);
-  table.append(thead);
-
-  const tbody = document.createElement("tbody");
-  for (const row of block.rows) {
-    const tr = document.createElement("tr");
-    row.forEach((cell, c) => {
-      const td = document.createElement("td");
-      applyAlign(td, block.aligns[c]);
-      td.append(...formatInline(cell));
-      tr.append(td);
-    });
-    tbody.append(tr);
-  }
-  table.append(tbody);
-  wrap.append(table);
-  return wrap;
-}
-
 function processRow(row: HTMLElement) {
   // The reprocessing guard lives on the CONTENT node, not the row: Discord replaces
   // `[id^="message-content-"]` wholesale when a message is edited, so a marker set on
@@ -84,7 +41,7 @@ function processRow(row: HTMLElement) {
   // Only persist the reprocess guard once a table was actually rendered. If no table
   // was found, leaving the guard unset lets the next dispatch retry — cheap, and it
   // avoids permanently marking a message that briefly had no locatable table.
-  const rendered = renderTablesInContent(contentEl, renderTable);
+  const rendered = renderTablesInContent(contentEl);
   if (rendered > 0) contentEl.dataset.mdTables = "1";
 }
 
