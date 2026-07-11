@@ -7,8 +7,7 @@
 import {
   type Align,
   formatInline,
-  parseTables,
-  replaceTablesInContent,
+  renderTablesInContent,
   restoreReplacedTables,
   type TableBlock,
 } from "./core";
@@ -18,7 +17,6 @@ const {
     storesFlat: { SelectedChannelStore },
     dispatcher,
   },
-  util: { getFiber, reactFiberWalker },
   observeDom,
   ui: { injectCss },
 } = shelter;
@@ -74,27 +72,20 @@ function processRow(row: HTMLElement) {
   // The reprocessing guard lives on the CONTENT node, not the row: Discord replaces
   // `[id^="message-content-"]` wholesale when a message is edited, so a marker set on
   // the row would survive the edit and permanently block re-rendering. Marking the
-  // content node instead means an edit naturally re-processes (FINDING A).
+  // content node instead means an edit naturally re-processes.
   const contentEl = row.querySelector('[id^="message-content-"]') as HTMLElement | null;
   if (!contentEl) return;
   if (contentEl.dataset.mdTables === "1") return;
 
-  const msg = reactFiberWalker(getFiber(row), "message", true)?.memoizedProps?.message as any;
-  const content: string | undefined = msg?.content;
-  if (!content || !content.includes("|")) return;
+  // Detection reads the RENDERED text (not the fiber's raw content), so a table whose
+  // cells Discord already formatted is still found. Cheap bail before the DOM walk.
+  if (!(contentEl.textContent ?? "").includes("|")) return;
 
-  const blocks = parseTables(content);
-  if (!blocks.length) return;
-
-  // Only persist the reprocess guard once a table was actually located and
-  // rendered in the DOM. A table cell containing a Discord mention/custom emoji
-  // renders differently in the DOM than in raw `message.content` (e.g. `<@123>`
-  // becomes the text "@Bob"), so `matchRange` can silently fail to locate it. If we
-  // set the guard unconditionally, that message's raw pipe text would stay visible
-  // forever with no retry path. Leaving the guard unset means the next dispatch
-  // retries — cheap, since `parseTables` is pure and skipped DOM work is free.
-  const replaced = replaceTablesInContent(contentEl, content, blocks, renderTable);
-  if (replaced > 0) contentEl.dataset.mdTables = "1";
+  // Only persist the reprocess guard once a table was actually rendered. If no table
+  // was found, leaving the guard unset lets the next dispatch retry — cheap, and it
+  // avoids permanently marking a message that briefly had no locatable table.
+  const rendered = renderTablesInContent(contentEl, renderTable);
+  if (rendered > 0) contentEl.dataset.mdTables = "1";
 }
 
 const TRIGGERS = [

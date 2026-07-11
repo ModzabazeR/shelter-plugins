@@ -1,222 +1,199 @@
 /*
  * DOM-replacement logic for md-tables.
- * Locates each parsed table block inside a rendered message-content element (by its
- * source line range in the raw message string) and swaps the table's own DOM lines
- * for a rendered `<table>` — without touching any surrounding text, even when a
- * table line shares a Text node with non-table content (a single Text node can hold
- * several "\n"-separated lines when Discord doesn't split lines into <br> elements).
  *
- * The replacement is NON-DESTRUCTIVE: the matched raw-line nodes are never removed.
- * They're moved (in order, at their original position) into a single hidden
- * `<span class="mdt-src" style="display:none">` wrapper, and the rendered table is
- * inserted immediately next to that wrapper. `restoreReplacedTables()` reverses this
- * exactly — it removes every inserted table and unwraps every `.mdt-src` span, so
- * `onUnload` can restore the original view without leaving the message blank.
+ * Detection works off the RENDERED message DOM, not the raw `message.content`
+ * string. That is the load-bearing correction: Discord renders inline markdown
+ * inside table cells (e.g. `**bold**` becomes a `<strong>`), so the raw content
+ * string does not match the rendered text, and a message's lines are split across
+ * `<span>`/`<strong>`/... siblings with the "\n"s living inside those spans. We
+ * therefore reconstruct each inline run's rendered text, detect GFM tables in it,
+ * and carve the table's exact character span out of the DOM with a `Range` — which
+ * transparently splits nested Text nodes and partially-selected element ancestors.
  *
- * This module is pure DOM manipulation: it never references the `shelter` global and
- * never formats cell content itself — the caller supplies `makeTable`.
+ * The replacement is NON-DESTRUCTIVE: the carved-out rendered nodes are not thrown
+ * away. They are stashed in a hidden `<span class="mdt-src">` holder placed where the
+ * table now sits, and `restoreReplacedTables()` puts them back exactly (removing the
+ * inserted table and unwrapping the holder) so `onUnload` never leaves a blank gap.
+ *
+ * This module is pure DOM: it never touches the `shelter` global. The caller supplies
+ * `makeTable(block)` to build the visible table from a parsed block.
+ *
+ * KNOWN LIMITATION (v0.1): cells render as plain text. Inline formatting Discord had
+ * rendered inside a cell (bold/italic/code/mentions/emoji) is flattened to text,
+ * because detection reads the already-rendered (marker-free) text. Preserving in-cell
+ * formatting by moving the rendered nodes into the cells is a follow-up.
  */
 
-import type { TableBlock } from "./parseTables";
+import { parseTables, type TableBlock } from "./parseTables";
 
-interface Line {
-  text: string;
-  nodes: Node[];
-}
+// Block-level tags break an inline run: a GFM table never spans across one, and their
+// text must not be glued to adjacent lines. Everything else at the top level of a
+// message-content element (#text, SPAN, STRONG, EM, CODE, A, IMG, BR, ...) is inline.
+const BLOCK_TAGS = new Set([
+  "H1", "H2", "H3", "H4", "H5", "H6",
+  "UL", "OL", "LI", "P", "DIV", "BLOCKQUOTE", "PRE", "HR",
+  "TABLE", "ASIDE", "SECTION", "ARTICLE", "FIGURE",
+]);
 
-// Marks a table this module inserted, so `restoreReplacedTables` can find and remove
-// it regardless of whatever classes/structure the caller's `makeTable` used.
 const MDT_INSERTED_ATTR = "data-mdt-inserted";
-// `.mdt-wrap` is the Shelter integration's own wrapper class (see index.tsx). Matching
-// it too, alongside the internal attribute above, is defense in depth.
+// `.mdt-wrap` is the Shelter integration's own wrapper class (index.tsx). Matching it
+// too, alongside the internal attribute, is defense in depth on restore.
 const MDT_INSERTED_SELECTOR = `[${MDT_INSERTED_ATTR}], .mdt-wrap`;
 const MDT_SRC_CLASS = "mdt-src";
 
-function isNewlineMarker(node: Node): boolean {
-  return node.nodeType === Node.TEXT_NODE && node.textContent === "\n";
+function isBlock(n: Node): boolean {
+  return n.nodeType === Node.ELEMENT_NODE && BLOCK_TAGS.has(n.nodeName);
 }
 
-// Ensure no single Text node spans more than one logical line: any Text node whose
-// data contains "\n" is replaced by a run of sibling nodes — one Text node per
-// non-empty line chunk, plus a standalone one-character "\n" Text node marking each
-// line boundary (treated the same way a <br> is). Handles leading/trailing and
-// consecutive newlines without producing spurious nodes or crashing. This is
-// visually inert (identical rendered text, identical serialized innerHTML for plain
-// adjacent Text nodes) even when no block ends up matching.
-function normalizeNewlines(root: HTMLElement): void {
-  const doc = root.ownerDocument ?? document;
-  const textNodes = Array.from(root.childNodes).filter(
-    (n): n is Text => n.nodeType === Node.TEXT_NODE,
-  );
-  for (const textNode of textNodes) {
-    const raw = textNode.data;
-    if (!raw.includes("\n")) continue;
-
-    const parts = raw.split("\n");
-    const replacements: Node[] = [];
-    parts.forEach((part, idx) => {
-      if (part.length > 0) replacements.push(doc.createTextNode(part));
-      if (idx < parts.length - 1) replacements.push(doc.createTextNode("\n"));
-    });
-
-    const parent = textNode.parentNode;
-    if (!parent) continue;
-    for (const node of replacements) parent.insertBefore(node, textNode);
-    parent.removeChild(textNode);
-  }
+// Map from a character offset in the reconstructed run text to a descendant Text node.
+interface TextSeg {
+  node: Text;
+  start: number; // char offset of this node's text within the run string
+  len: number;
 }
 
-// Walk a (now newline-normalized) message-content element into logical lines,
-// tracking exactly which DOM nodes compose each line. A boundary — a <br> element or
-// a lone "\n" Text node — belongs to the line it ends, mirroring how the trailing
-// separator before the next line is never shared with that next line.
-function collectLines(root: HTMLElement): Line[] {
-  const lines: Line[] = [];
-  let cur: Line = { text: "", nodes: [] };
-  const endLine = () => {
-    lines.push(cur);
-    cur = { text: "", nodes: [] };
-  };
-  for (const child of Array.from(root.childNodes)) {
-    if (child.nodeName === "BR" || isNewlineMarker(child)) {
-      cur.nodes.push(child);
-      endLine();
+// Reconstruct an inline run's rendered text and record where each descendant Text
+// node sits within it, so a character span can be turned into a DOM Range. A <br>
+// contributes a "\n" with no node (line boundaries never become Range edges).
+function buildRunText(run: Node[]): { text: string; segs: TextSeg[] } {
+  let text = "";
+  const segs: TextSeg[] = [];
+  const visit = (node: Node) => {
+    if (node.nodeType === Node.TEXT_NODE) {
+      const t = node as Text;
+      segs.push({ node: t, start: text.length, len: t.data.length });
+      text += t.data;
+    } else if (node.nodeName === "BR") {
+      text += "\n";
     } else {
-      cur.nodes.push(child);
-      cur.text += child.textContent ?? "";
+      for (const child of Array.from(node.childNodes)) visit(child);
     }
-  }
-  // Only append a trailing line when content actually followed the last boundary —
-  // otherwise a message ending in <br> (or a trailing "\n") would yield a spurious
-  // empty final line.
-  if (cur.nodes.length > 0) lines.push(cur);
-  return lines;
+  };
+  for (const n of run) visit(n);
+  return { text, segs };
 }
 
-// Find the first contiguous run of `lines` whose trimmed text matches `blockLines`,
-// and return the (deduplicated, in order) DOM nodes that make up exactly those lines.
-function matchRange(lines: Line[], blockLines: string[]): Node[] | null {
-  for (let start = 0; start + blockLines.length <= lines.length; start++) {
-    let matches = true;
-    for (let k = 0; k < blockLines.length; k++) {
-      if (lines[start + k].text.trim() !== blockLines[k]) {
-        matches = false;
-        break;
-      }
+// Resolve a character offset to (Text node, offset within it). Prefers a position at
+// the *start* of a segment over the end of the previous one, so a Range endpoint lands
+// on a real character rather than a zero-length boundary where possible.
+function locate(segs: TextSeg[], char: number): { node: Text; offset: number } | null {
+  for (const s of segs) {
+    if (char >= s.start && char < s.start + s.len) {
+      return { node: s.node, offset: char - s.start };
     }
-    if (!matches) continue;
-
-    const nodes: Node[] = [];
-    for (let k = 0; k < blockLines.length; k++) {
-      for (const n of lines[start + k].nodes) {
-        if (!nodes.includes(n)) nodes.push(n);
-      }
-    }
-    return nodes;
+  }
+  // End-of-run (or a boundary that coincides with a segment end): clamp to the last
+  // segment that ends at or before `char`.
+  let best: TextSeg | undefined;
+  for (const s of segs) {
+    if (s.start + s.len <= char) best = s;
+    else if (s.start <= char) best = s;
+  }
+  if (best && char >= best.start && char <= best.start + best.len) {
+    return { node: best.node, offset: char - best.start };
   }
   return null;
 }
 
-// Move `nodes` (in order, at their shared original position) into a single hidden
-// `.mdt-src` wrapper, then insert `replacement` immediately after that wrapper.
-// Nothing is deleted — `restoreReplacedTables` can undo this exactly.
-function wrapAndInsert(nodes: Node[], replacement: HTMLElement): void {
-  const first = nodes[0];
-  const parent = first?.parentNode;
-  if (!parent) return;
-
-  const doc = parent.ownerDocument ?? document;
-  const srcSpan = doc.createElement("span");
-  srcSpan.className = MDT_SRC_CLASS;
-  // Inline style as defense in depth (in case the plugin's CSS is unloaded/missing);
-  // the `.mdt-src{display:none}` rule in index.tsx's injected CSS is the primary one.
-  srcSpan.style.display = "none";
-
-  parent.insertBefore(srcSpan, first);
-  for (const n of nodes) srcSpan.appendChild(n);
-
-  replacement.setAttribute(MDT_INSERTED_ATTR, "1");
-  parent.insertBefore(replacement, srcSpan.nextSibling);
+// Character span [start, end) covered by a table block within the run text.
+function blockCharRange(runLines: string[], block: TableBlock): [number, number] {
+  let start = 0;
+  for (let i = 0; i < block.startLine; i++) start += runLines[i].length + 1;
+  let end = start;
+  for (let i = block.startLine; i <= block.endLine; i++) {
+    end += runLines[i].length;
+    if (i < block.endLine) end += 1; // the "\n" between rows
+  }
+  return [start, end];
 }
 
 /**
- * Replace, inside `contentEl`, the DOM text of each table block (located by its
- * source line range in `content`) with `makeTable(block)`. Hides ONLY the table's
- * own lines — never surrounding text, even when a line shares a Text node with
- * non-table text — by moving them into a hidden `.mdt-src` span rather than deleting
- * them, so `restoreReplacedTables` can bring the original view back exactly.
- * No-op for any block whose lines can't be located in the DOM — e.g. a table cell
- * containing a Discord mention/emoji renders differently in the DOM than in the raw
- * `message.content` string, so its lines never match.
- * Blocks are applied last-to-first so earlier ranges stay valid.
+ * Detect every GFM table in `contentEl`'s rendered content and replace each in place
+ * with `makeTable(block)`. Detection reads the rendered DOM text (per inline run,
+ * split on block-level elements), so tables whose cells Discord already formatted are
+ * still found. Each table's exact character span is carved out with a Range, stashed
+ * in a hidden `.mdt-src` holder (so `restoreReplacedTables` can bring it back), and the
+ * table is inserted where it was.
  *
- * Returns the number of table blocks that were successfully located and replaced.
- * 0 means nothing in the DOM matched, and `contentEl` is left unchanged (including
- * undoing `normalizeNewlines`'s text-node split, which is otherwise required for
- * matching to work) — callers use this to decide whether it's safe to mark the
- * element as processed (see index.tsx's `processRow`).
+ * Returns the number of tables rendered. 0 means nothing was found and `contentEl` is
+ * untouched — callers use this to decide whether to mark the element processed.
  */
-export function replaceTablesInContent(
+export function renderTablesInContent(
   contentEl: HTMLElement,
-  content: string,
-  blocks: TableBlock[],
   makeTable: (block: TableBlock) => HTMLElement,
 ): number {
-  if (!blocks.length) return 0;
+  const doc = contentEl.ownerDocument ?? document;
 
-  // Snapshot the original children BEFORE normalizeNewlines mutates them, so a
-  // zero-match outcome can be undone exactly (see below).
-  const originalChildren = Array.from(contentEl.childNodes);
-
-  normalizeNewlines(contentEl);
-  const contentLines = content.split("\n");
-  const lines = collectLines(contentEl);
-
-  // Compute all match ranges FIRST, without mutating the DOM — matchRange only
-  // reads `lines`. This lets us tell, before touching anything, whether the
-  // zero-match case applies.
-  const matched: { block: TableBlock; range: Node[] }[] = [];
-  for (const block of blocks) {
-    const blockLines = contentLines
-      .slice(block.startLine, block.endLine + 1)
-      .map((s) => s.trim());
-    const range = matchRange(lines, blockLines);
-    if (range) matched.push({ block, range });
+  // Partition top-level children into inline runs separated by block elements.
+  const runs: Node[][] = [];
+  let cur: Node[] = [];
+  for (const child of Array.from(contentEl.childNodes)) {
+    if (isBlock(child)) {
+      if (cur.length) runs.push(cur);
+      cur = [];
+    } else {
+      cur.push(child);
+    }
   }
+  if (cur.length) runs.push(cur);
 
-  if (matched.length === 0) {
-    // Nothing matched: undo normalizeNewlines's text-node split so `contentEl` is
-    // left exactly as it was (same node identities, same childNodes.length) — no
-    // partial mutation leaks out of a no-op call.
-    while (contentEl.firstChild) contentEl.removeChild(contentEl.firstChild);
-    for (const node of originalChildren) contentEl.appendChild(node);
-    return 0;
-  }
+  let count = 0;
+  for (const run of runs) {
+    const { text, segs } = buildRunText(run);
+    if (!text.includes("|")) continue;
 
-  // Apply last-to-first so earlier ranges (computed against the pre-mutation
-  // `lines` snapshot) stay valid as later wraps rearrange sibling nodes.
-  for (const { block, range } of [...matched].reverse()) {
-    wrapAndInsert(range, makeTable(block));
+    const blocks = parseTables(text);
+    if (!blocks.length) continue;
+
+    const runLines = text.split("\n");
+    // Apply last-to-first: extracting a later block only splits nodes at/after its own
+    // start, so earlier blocks' segment offsets stay valid.
+    for (const block of [...blocks].reverse()) {
+      const [sc, ec] = blockCharRange(runLines, block);
+      const startPos = locate(segs, sc);
+      const endPos = locate(segs, ec);
+      if (!startPos || !endPos) continue;
+
+      const range = doc.createRange();
+      try {
+        range.setStart(startPos.node, startPos.offset);
+        range.setEnd(endPos.node, endPos.offset);
+      } catch {
+        continue;
+      }
+
+      const frag = range.extractContents();
+
+      const holder = doc.createElement("span");
+      holder.className = MDT_SRC_CLASS;
+      holder.style.display = "none";
+      holder.appendChild(frag);
+
+      const table = makeTable(block);
+      table.setAttribute(MDT_INSERTED_ATTR, "1");
+
+      // The range has collapsed to the extraction point; drop the holder there, then
+      // the table right after it.
+      range.insertNode(holder);
+      holder.parentNode?.insertBefore(table, holder.nextSibling);
+      count++;
+    }
   }
-  return matched.length;
+  return count;
 }
 
 /**
- * Undo every replacement made by `replaceTablesInContent` within `root`: removes
- * every inserted table (identified by the internal marker `wrapAndInsert` sets, and
- * by the Shelter integration's `.mdt-wrap` class as a fallback) and unwraps every
- * `.mdt-src` span — moving its child nodes back into the parent at the span's
- * position, then removing the span — so the DOM ends up equivalent to the original.
+ * Undo every replacement made by `renderTablesInContent` within `root`: remove every
+ * inserted table and unwrap every `.mdt-src` holder — moving its stashed original nodes
+ * back where the table sat — so the DOM returns to its pre-replacement rendering.
  */
 export function restoreReplacedTables(root: ParentNode): void {
-  // Remove inserted tables first; they sit next to (not inside) the `.mdt-src`
-  // spans, so order relative to the unwrap step below doesn't matter for correctness.
   root.querySelectorAll(MDT_INSERTED_SELECTOR).forEach((el) => el.remove());
 
-  root.querySelectorAll(`.${MDT_SRC_CLASS}`).forEach((span) => {
-    const parent = span.parentNode;
+  root.querySelectorAll(`.${MDT_SRC_CLASS}`).forEach((holder) => {
+    const parent = holder.parentNode;
     if (!parent) return;
-    while (span.firstChild) parent.insertBefore(span.firstChild, span);
-    parent.removeChild(span);
+    while (holder.firstChild) parent.insertBefore(holder.firstChild, holder);
+    parent.removeChild(holder);
   });
 }
