@@ -144,116 +144,133 @@ function parseSegment(text, doc) {
 
 //#endregion
 //#region plugins/md-tables/core/replaceTables.ts
+const BLOCK_TAGS = new Set([
+	"H1",
+	"H2",
+	"H3",
+	"H4",
+	"H5",
+	"H6",
+	"UL",
+	"OL",
+	"LI",
+	"P",
+	"DIV",
+	"BLOCKQUOTE",
+	"PRE",
+	"HR",
+	"TABLE",
+	"ASIDE",
+	"SECTION",
+	"ARTICLE",
+	"FIGURE"
+]);
 const MDT_INSERTED_ATTR = "data-mdt-inserted";
 const MDT_INSERTED_SELECTOR = `[${MDT_INSERTED_ATTR}], .mdt-wrap`;
 const MDT_SRC_CLASS = "mdt-src";
-function isNewlineMarker(node) {
-	return node.nodeType === Node.TEXT_NODE && node.textContent === "\n";
+function isBlock(n) {
+	return n.nodeType === Node.ELEMENT_NODE && BLOCK_TAGS.has(n.nodeName);
 }
-function normalizeNewlines(root) {
-	const doc = root.ownerDocument ?? document;
-	const textNodes = Array.from(root.childNodes).filter((n) => n.nodeType === Node.TEXT_NODE);
-	for (const textNode of textNodes) {
-		const raw = textNode.data;
-		if (!raw.includes("\n")) continue;
-		const parts = raw.split("\n");
-		const replacements = [];
-		parts.forEach((part, idx) => {
-			if (part.length > 0) replacements.push(doc.createTextNode(part));
-			if (idx < parts.length - 1) replacements.push(doc.createTextNode("\n"));
-		});
-		const parent = textNode.parentNode;
-		if (!parent) continue;
-		for (const node of replacements) parent.insertBefore(node, textNode);
-		parent.removeChild(textNode);
-	}
-}
-function collectLines(root) {
-	const lines = [];
-	let cur = {
-		text: "",
-		nodes: []
+function buildRunText(run) {
+	let text = "";
+	const segs = [];
+	const visit = (node) => {
+		if (node.nodeType === Node.TEXT_NODE) {
+			const t = node;
+			segs.push({
+				node: t,
+				start: text.length,
+				len: t.data.length
+			});
+			text += t.data;
+		} else if (node.nodeName === "BR") text += "\n";
+else for (const child of Array.from(node.childNodes)) visit(child);
 	};
-	const endLine = () => {
-		lines.push(cur);
-		cur = {
-			text: "",
-			nodes: []
-		};
+	for (const n of run) visit(n);
+	return {
+		text,
+		segs
 	};
-	for (const child of Array.from(root.childNodes)) if (child.nodeName === "BR" || isNewlineMarker(child)) {
-		cur.nodes.push(child);
-		endLine();
-	} else {
-		cur.nodes.push(child);
-		cur.text += child.textContent ?? "";
-	}
-	if (cur.nodes.length > 0) lines.push(cur);
-	return lines;
 }
-function matchRange(lines, blockLines) {
-	for (let start = 0; start + blockLines.length <= lines.length; start++) {
-		let matches = true;
-		for (let k = 0; k < blockLines.length; k++) if (lines[start + k].text.trim() !== blockLines[k]) {
-			matches = false;
-			break;
-		}
-		if (!matches) continue;
-		const nodes = [];
-		for (let k = 0; k < blockLines.length; k++) for (const n of lines[start + k].nodes) if (!nodes.includes(n)) nodes.push(n);
-		return nodes;
-	}
+function locate(segs, char) {
+	for (const s of segs) if (char >= s.start && char < s.start + s.len) return {
+		node: s.node,
+		offset: char - s.start
+	};
+	let best;
+	for (const s of segs) if (s.start + s.len <= char) best = s;
+else if (s.start <= char) best = s;
+	if (best && char >= best.start && char <= best.start + best.len) return {
+		node: best.node,
+		offset: char - best.start
+	};
 	return null;
 }
-function wrapAndInsert(nodes, replacement) {
-	const first = nodes[0];
-	const parent = first?.parentNode;
-	if (!parent) return;
-	const doc = parent.ownerDocument ?? document;
-	const srcSpan = doc.createElement("span");
-	srcSpan.className = MDT_SRC_CLASS;
-	srcSpan.style.display = "none";
-	parent.insertBefore(srcSpan, first);
-	for (const n of nodes) srcSpan.appendChild(n);
-	replacement.setAttribute(MDT_INSERTED_ATTR, "1");
-	parent.insertBefore(replacement, srcSpan.nextSibling);
+function blockCharRange(runLines, block) {
+	let start = 0;
+	for (let i = 0; i < block.startLine; i++) start += runLines[i].length + 1;
+	let end = start;
+	for (let i = block.startLine; i <= block.endLine; i++) {
+		end += runLines[i].length;
+		if (i < block.endLine) end += 1;
+	}
+	return [start, end];
 }
-function replaceTablesInContent(contentEl, content, blocks, makeTable) {
-	if (!blocks.length) return 0;
-	const originalChildren = Array.from(contentEl.childNodes);
-	normalizeNewlines(contentEl);
-	const contentLines = content.split("\n");
-	const lines = collectLines(contentEl);
-	const matched = [];
-	for (const block of blocks) {
-		const blockLines = contentLines.slice(block.startLine, block.endLine + 1).map((s) => s.trim());
-		const range = matchRange(lines, blockLines);
-		if (range) matched.push({
-			block,
-			range
-		});
+function renderTablesInContent(contentEl, makeTable) {
+	const doc = contentEl.ownerDocument ?? document;
+	const runs = [];
+	let cur = [];
+	for (const child of Array.from(contentEl.childNodes)) if (isBlock(child)) {
+		if (cur.length) runs.push(cur);
+		cur = [];
+	} else cur.push(child);
+	if (cur.length) runs.push(cur);
+	let count = 0;
+	for (const run of runs) {
+		const { text, segs } = buildRunText(run);
+		if (!text.includes("|")) continue;
+		const blocks = parseTables(text);
+		if (!blocks.length) continue;
+		const runLines = text.split("\n");
+		for (const block of [...blocks].reverse()) {
+			const [sc, ec] = blockCharRange(runLines, block);
+			const startPos = locate(segs, sc);
+			const endPos = locate(segs, ec);
+			if (!startPos || !endPos) continue;
+			const range = doc.createRange();
+			try {
+				range.setStart(startPos.node, startPos.offset);
+				range.setEnd(endPos.node, endPos.offset);
+			} catch {
+				continue;
+			}
+			const frag = range.extractContents();
+			const holder = doc.createElement("span");
+			holder.className = MDT_SRC_CLASS;
+			holder.style.display = "none";
+			holder.appendChild(frag);
+			const table = makeTable(block);
+			table.setAttribute(MDT_INSERTED_ATTR, "1");
+			range.insertNode(holder);
+			holder.parentNode?.insertBefore(table, holder.nextSibling);
+			count++;
+		}
 	}
-	if (matched.length === 0) {
-		while (contentEl.firstChild) contentEl.removeChild(contentEl.firstChild);
-		for (const node of originalChildren) contentEl.appendChild(node);
-		return 0;
-	}
-	for (const { block, range } of [...matched].reverse()) wrapAndInsert(range, makeTable(block));
-	return matched.length;
+	return count;
 }
 function restoreReplacedTables(root) {
 	root.querySelectorAll(MDT_INSERTED_SELECTOR).forEach((el) => el.remove());
-	root.querySelectorAll(`.${MDT_SRC_CLASS}`).forEach((span) => {
-		const parent = span.parentNode;
+	root.querySelectorAll(`.${MDT_SRC_CLASS}`).forEach((holder) => {
+		const parent = holder.parentNode;
 		if (!parent) return;
-		while (span.firstChild) parent.insertBefore(span.firstChild, span);
-		parent.removeChild(span);
+		while (holder.firstChild) parent.insertBefore(holder.firstChild, holder);
+		parent.removeChild(holder);
 	});
 }
 
 //#endregion
 //#region plugins/md-tables/index.tsx
-const { flux: { storesFlat: { SelectedChannelStore }, dispatcher }, util: { getFiber, reactFiberWalker }, observeDom, ui: { injectCss } } = shelter;
+const { flux: { storesFlat: { SelectedChannelStore }, dispatcher }, observeDom, ui: { injectCss } } = shelter;
 const CSS = `
 .mdt-wrap{max-width:100%;overflow-x:auto;margin:6px 0}
 .mdt-table{border-collapse:collapse;font-size:.95rem;line-height:1.35}
@@ -300,13 +317,9 @@ function processRow(row) {
 	const contentEl = row.querySelector("[id^=\"message-content-\"]");
 	if (!contentEl) return;
 	if (contentEl.dataset.mdTables === "1") return;
-	const msg = reactFiberWalker(getFiber(row), "message", true)?.memoizedProps?.message;
-	const content = msg?.content;
-	if (!content || !content.includes("|")) return;
-	const blocks = parseTables(content);
-	if (!blocks.length) return;
-	const replaced = replaceTablesInContent(contentEl, content, blocks, renderTable);
-	if (replaced > 0) contentEl.dataset.mdTables = "1";
+	if (!(contentEl.textContent ?? "").includes("|")) return;
+	const rendered = renderTablesInContent(contentEl, renderTable);
+	if (rendered > 0) contentEl.dataset.mdTables = "1";
 }
 const TRIGGERS = [
 	"MESSAGE_CREATE",
