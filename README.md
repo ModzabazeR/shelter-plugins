@@ -12,6 +12,7 @@ Renders GFM markdown tables inline in Discord messages — Discord doesn't rende
 
 - Auto-renders tables in place; basic inline formatting (bold/italic/code/strike) inside cells; column alignment honored.
 - Cell content is rendered as text nodes only (no HTML injection).
+- Renders `.md` file attachments as formatted GFM documents in a collapsible card (Full view + Download included). Content is DOMPurify-sanitized; images are stripped to links so rendering never makes a network request.
 
 ## Development
 

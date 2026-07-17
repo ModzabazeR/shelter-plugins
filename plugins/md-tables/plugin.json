@@ -1,5 +1,5 @@
 {
   "name": "Markdown Tables",
   "author": "modda",
-  "description": "Renders GFM markdown tables inline in Discord messages."
+  "description": "Renders GFM markdown tables inline in Discord messages, and .md file attachments as formatted documents."
 }
