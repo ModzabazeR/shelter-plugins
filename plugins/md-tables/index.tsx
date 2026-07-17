@@ -197,9 +197,26 @@ function MdCard(props: { att: any }) {
   );
 }
 
-// Solid dispose functions + natively-hidden attachment wrappers, tracked for onUnload.
-const disposers: Array<() => void> = [];
+// Mount root -> its Solid dispose fn, plus natively-hidden attachment wrappers.
+// Discord virtualizes rows, so mounts constantly leave the DOM long before
+// onUnload — pruneDetached() reclaims them amortized, once per dispatch.
+const mounts = new Map<HTMLElement, () => void>();
 const hiddenNativeEls = new Set<HTMLElement>();
+
+function pruneDetached() {
+  for (const [mount, dispose] of mounts) {
+    if (mount.isConnected) continue;
+    try {
+      dispose();
+    } catch {
+      /* ignore */
+    }
+    mounts.delete(mount);
+  }
+  for (const el of hiddenNativeEls) {
+    if (!el.isConnected) hiddenNativeEls.delete(el);
+  }
+}
 
 function processAttachments(row: HTMLElement) {
   // Row-level guard (html-viewer style): attachments live in the accessories
@@ -236,7 +253,7 @@ function processAttachments(row: HTMLElement) {
 
     const mount = document.createElement("div");
     mount.className = "mdt-mount";
-    disposers.push(render(() => <MdCard att={att} />, mount));
+    mounts.set(mount, render(() => <MdCard att={att} />, mount));
     (contents ?? row).appendChild(mount);
   }
 }
@@ -273,6 +290,7 @@ const TRIGGERS = [
 const activeObservers = new Set<() => void>();
 
 function handleDispatch(payload: any) {
+  pruneDetached();
   if (
     (payload.type === "MESSAGE_CREATE" || payload.type === "MESSAGE_UPDATE") &&
     payload.message?.channel_id !== (SelectedChannelStore as any).getChannelId()
@@ -323,13 +341,14 @@ export function onUnload() {
   for (const stop of [...activeObservers]) stop();
 
   // Attachment cards: dispose Solid roots, drop mounts, un-hide native cards.
-  for (const d of disposers.splice(0)) {
+  for (const [, dispose] of mounts) {
     try {
-      d();
+      dispose();
     } catch {
       /* ignore */
     }
   }
+  mounts.clear();
   document.querySelectorAll(".mdt-mount").forEach((n) => n.remove());
   for (const el of hiddenNativeEls) el.style.display = "";
   hiddenNativeEls.clear();
