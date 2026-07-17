@@ -69,4 +69,15 @@ describe("GFM rendering", () => {
   it("returns empty output for empty input", () => {
     expect(renderMarkdownToHtml("").trim()).toBe("");
   });
+
+  it("preserves ordered-list start", () => {
+    const el = mount("3. a\n4. b");
+    expect(el.querySelector("ol")?.getAttribute("start")).toBe("3");
+  });
+
+  it("preserves table column alignment", () => {
+    const el = mount("| a |\n| :-: |\n| 1 |");
+    const th = el.querySelector("th");
+    expect(th?.getAttribute("align")).toBe("center");
+  });
 });

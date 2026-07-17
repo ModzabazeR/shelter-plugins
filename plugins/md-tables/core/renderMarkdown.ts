@@ -55,26 +55,12 @@ const PURIFY_CONFIG = {
   ],
   ALLOWED_ATTR: ["href", "align", "start", "type", "checked", "disabled", "class"],
   ALLOWED_URI_REGEXP: /^(?:https?:|mailto:)/i,
+  // Non-URI attributes must be exempted from ALLOWED_URI_REGEXP, which DOMPurify
+  // otherwise applies to every attribute value (stripping type="checkbox" etc.).
+  ADD_URI_SAFE_ATTR: ["type", "checked", "disabled", "align", "start"],
 };
-
-// Post-process HTML to handle GFM task lists manually.
-// marked v18+ doesn't render task list checkboxes natively, so we detect and inject them.
-function injectTaskListCheckboxes(html: string): string {
-  // Detect task list pattern: [x] or [ ] inside <li> tags
-  // Account for various whitespace and potential markup structures
-  let result = html.replace(
-    /<li>\s*\[\s*([x ])\s*\]/g,
-    (match, checked) => {
-      const checkAttr = checked.trim() === "x" ? ' checked' : '';
-      return `<li><input type="checkbox"${checkAttr}> `;
-    }
-  );
-
-  return result;
-}
 
 export function renderMarkdownToHtml(text: string): string {
   const raw = parser.parse(text, { async: false }) as string;
-  const withTaskLists = injectTaskListCheckboxes(raw);
-  return purifier.sanitize(withTaskLists, PURIFY_CONFIG);
+  return purifier.sanitize(raw, PURIFY_CONFIG);
 }
