@@ -81,3 +81,63 @@ describe("GFM rendering", () => {
     expect(th?.getAttribute("align")).toBe("center");
   });
 });
+
+describe("sanitization", () => {
+  it("strips <script>", () => {
+    const out = renderMarkdownToHtml("hi\n\n<script>alert(1)</script>");
+    expect(out).not.toContain("<script");
+    expect(out).not.toContain("alert(1)");
+  });
+
+  it("strips event handler attributes on raw HTML", () => {
+    const out = renderMarkdownToHtml('<a href="https://x.y" onclick="evil()">x</a>');
+    expect(out).not.toContain("onclick");
+  });
+
+  it("removes raw <img>, including onerror payloads", () => {
+    const out = renderMarkdownToHtml('<img src="https://t.example/p.gif" onerror="evil()">');
+    expect(out).not.toContain("<img");
+    expect(out).not.toContain("onerror");
+  });
+
+  it("removes javascript: and data: hrefs", () => {
+    const out = renderMarkdownToHtml(
+      "[a](javascript:alert(1))\n\n[b](data:text/html,x)",
+    );
+    expect(out).not.toContain("javascript:");
+    expect(out).not.toContain("data:");
+  });
+
+  it("removes iframes, style blocks, and svg", () => {
+    const out = renderMarkdownToHtml(
+      '<iframe src="https://x.y"></iframe>\n\n<style>*{color:red}</style>\n\n<svg onload="evil()"></svg>',
+    );
+    expect(out).not.toContain("<iframe");
+    expect(out).not.toContain("<style");
+    expect(out).not.toContain("<svg");
+  });
+
+  it("forces target=_blank rel=noopener noreferrer on every link", () => {
+    const el = mount('[a](https://x.y) and <a href="https://z.w">b</a>');
+    const anchors = el.querySelectorAll("a");
+    expect(anchors.length).toBe(2);
+    anchors.forEach((a) => {
+      expect(a.getAttribute("target")).toBe("_blank");
+      expect(a.getAttribute("rel")).toBe("noopener noreferrer");
+    });
+  });
+
+  it("removes non-checkbox inputs entirely", () => {
+    const el = mount('<input type="text" value="x"> <input type="checkbox">');
+    const inputs = el.querySelectorAll("input");
+    expect(inputs.length).toBe(1);
+    expect(inputs[0].getAttribute("type")).toBe("checkbox");
+    expect(inputs[0].hasAttribute("disabled")).toBe(true);
+  });
+
+  it("neutralizes HTML hidden inside fenced code", () => {
+    const el = mount('```\n<script>alert(1)</script>\n```');
+    expect(el.querySelector("script")).toBeNull();
+    expect(el.querySelector("pre code")?.textContent).toContain("<script>alert(1)</script>");
+  });
+});
