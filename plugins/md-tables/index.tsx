@@ -121,7 +121,11 @@ function openFullView(att: any) {
         </ModalRoot>
       ));
     })
-    .catch((e) => console.error("[md-tables] full view failed", e));
+    .catch((e) => {
+      console.error("[md-tables] full view failed", e);
+      // Same visible fallback as download(): hand the URL to the browser.
+      window.open(att.url, "_blank");
+    });
 }
 
 function MdCard(props: { att: any }) {
@@ -160,7 +164,13 @@ function MdCard(props: { att: any }) {
         <span class="mdt-size">{formatBytes(att.size)}</span>
         <span class="mdt-spacer" />
         <Show when={!tooBig}>
-          <button class="mdt-btn" onClick={() => setOpen(!open())}>
+          <button
+            class="mdt-btn"
+            onClick={() => {
+              if (!open() && error() !== undefined) setError(undefined);
+              setOpen(!open());
+            }}
+          >
             {open() ? "Collapse" : "Expand"}
           </button>
         </Show>
