@@ -197,6 +197,50 @@ function MdCard(props: { att: any }) {
   );
 }
 
+// Solid dispose functions + natively-hidden attachment wrappers, tracked for onUnload.
+const disposers: Array<() => void> = [];
+const hiddenNativeEls = new Set<HTMLElement>();
+
+function processAttachments(row: HTMLElement) {
+  // Row-level guard (html-viewer style): attachments live in the accessories
+  // container, which Discord does NOT swap the way it swaps content nodes, so a
+  // per-row marker is safe here. Only set once md attachments were actually found,
+  // so a row whose fiber wasn't ready yet gets retried on the next dispatch.
+  if (row.dataset.mdtAtt === "1") return;
+
+  const msg = reactFiberWalker(getFiber(row), "message", true)?.memoizedProps
+    ?.message as any;
+  const artifacts: any[] = (msg?.attachments ?? []).filter(isMdAttachment);
+  if (!artifacts.length) return;
+  row.dataset.mdtAtt = "1";
+
+  // The indented content column (username + text) — mounting here aligns the card
+  // with the message text, same trick as html-viewer.
+  const contents = row.querySelector('[class*="contents"]') as HTMLElement | null;
+
+  for (const att of artifacts) {
+    const link = row.querySelector(`a[href*="${att.id}"]`) as HTMLElement | null;
+
+    // Discord shows a .md attachment as a "non-visual media" card with a source
+    // preview. Hide that wrapper non-destructively (display:none + remember it),
+    // with the same fallback chain html-viewer uses for class-prefix drift.
+    const nativeWrap =
+      (link?.closest('[class*="nonVisualMediaItemContainer"]') as HTMLElement | null) ??
+      (link?.closest(
+        '[class*="nonVisualMediaItem"], [class*="mosaicItem"], [class*="messageAttachment"]',
+      ) as HTMLElement | null);
+    if (nativeWrap) {
+      nativeWrap.style.display = "none";
+      hiddenNativeEls.add(nativeWrap);
+    }
+
+    const mount = document.createElement("div");
+    mount.className = "mdt-mount";
+    disposers.push(render(() => <MdCard att={att} />, mount));
+    (contents ?? row).appendChild(mount);
+  }
+}
+
 function processRow(row: HTMLElement) {
   // The reprocessing guard lives on the CONTENT node, not the row: Discord replaces
   // `[id^="message-content-"]` wholesale when a message is edited, so a marker set on
@@ -250,6 +294,11 @@ function handleDispatch(payload: any) {
     } catch (err) {
       console.error("[md-tables] processRow failed", err);
     }
+    try {
+      processAttachments(e);
+    } catch (err) {
+      console.error("[md-tables] processAttachments failed", err);
+    }
   });
 
   let timeoutId: ReturnType<typeof setTimeout> | undefined;
@@ -272,6 +321,22 @@ export function onLoad() {
 export function onUnload() {
   for (const t of TRIGGERS) dispatcher.unsubscribe(t, handleDispatch);
   for (const stop of [...activeObservers]) stop();
+
+  // Attachment cards: dispose Solid roots, drop mounts, un-hide native cards.
+  for (const d of disposers.splice(0)) {
+    try {
+      d();
+    } catch {
+      /* ignore */
+    }
+  }
+  document.querySelectorAll(".mdt-mount").forEach((n) => n.remove());
+  for (const el of hiddenNativeEls) el.style.display = "";
+  hiddenNativeEls.clear();
+  document.querySelectorAll("[data-mdt-att]").forEach((el) => {
+    delete (el as HTMLElement).dataset.mdtAtt;
+  });
+
   // Non-destructive replace (FINDING B) means undo is a real restore, not just a
   // removal of inserted nodes: `restoreReplacedTables` also unwraps `.mdt-src` spans
   // so the original message text reappears instead of leaving a blank gap.
