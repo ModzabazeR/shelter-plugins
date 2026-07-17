@@ -58,6 +58,9 @@ const PURIFY_CONFIG = {
   // Non-URI attributes must be exempted from ALLOWED_URI_REGEXP, which DOMPurify
   // otherwise applies to every attribute value (stripping type="checkbox" etc.).
   ADD_URI_SAFE_ATTR: ["type", "checked", "disabled", "align", "start"],
+  // marked emits no data-* attributes; closing this surface keeps sanitized content
+  // from carrying plugin-marker lookalikes.
+  ALLOW_DATA_ATTR: false,
 };
 
 export function renderMarkdownToHtml(text: string): string {

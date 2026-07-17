@@ -72,16 +72,22 @@ const CSS = `
 const MAX_INLINE_KB = 512;
 const MAX_INLINE_BYTES = MAX_INLINE_KB * 1024;
 
-// fetch cache (attachment id -> raw markdown text)
-const mdCache = new Map<string, string>();
+// fetch cache (attachment id -> in-flight or settled fetch of the raw markdown).
+// Caching the promise dedups concurrent requests (e.g. double-click); a rejected
+// fetch evicts itself so Full view / Download / retry get a fresh attempt.
+const mdCache = new Map<string, Promise<string>>();
 
-async function fetchMd(att: any): Promise<string> {
-  if (mdCache.has(att.id)) return mdCache.get(att.id)!;
-  const res = await fetch(att.url);
-  if (!res.ok) throw new Error(`HTTP ${res.status}`);
-  const text = await res.text();
-  mdCache.set(att.id, text);
-  return text;
+function fetchMd(att: any): Promise<string> {
+  const cached = mdCache.get(att.id);
+  if (cached) return cached;
+  const pending = (async () => {
+    const res = await fetch(att.url);
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    return res.text();
+  })();
+  mdCache.set(att.id, pending);
+  pending.catch(() => mdCache.delete(att.id));
+  return pending;
 }
 
 function formatBytes(n: number): string {
@@ -236,11 +242,18 @@ function processAttachments(row: HTMLElement) {
   const contents = row.querySelector('[class*="contents"]') as HTMLElement | null;
 
   for (const att of artifacts) {
+    const mount = document.createElement("div");
+    mount.className = "mdt-mount";
+    mounts.set(mount, render(() => <MdCard att={att} />, mount));
+    (contents ?? row).appendChild(mount);
+
     const link = row.querySelector(`a[href*="${att.id}"]`) as HTMLElement | null;
 
     // Discord shows a .md attachment as a "non-visual media" card with a source
     // preview. Hide that wrapper non-destructively (display:none + remember it),
-    // with the same fallback chain html-viewer uses for class-prefix drift.
+    // with the same fallback chain html-viewer uses for class-prefix drift. This
+    // runs only after the replacement card is mounted, so a mount failure can
+    // never leave the attachment with no visible representation at all.
     const nativeWrap =
       (link?.closest('[class*="nonVisualMediaItemContainer"]') as HTMLElement | null) ??
       (link?.closest(
@@ -250,11 +263,6 @@ function processAttachments(row: HTMLElement) {
       nativeWrap.style.display = "none";
       hiddenNativeEls.add(nativeWrap);
     }
-
-    const mount = document.createElement("div");
-    mount.className = "mdt-mount";
-    mounts.set(mount, render(() => <MdCard att={att} />, mount));
-    (contents ?? row).appendChild(mount);
   }
 }
 
@@ -349,6 +357,7 @@ export function onUnload() {
     }
   }
   mounts.clear();
+  mdCache.clear();
   document.querySelectorAll(".mdt-mount").forEach((n) => n.remove());
   for (const el of hiddenNativeEls) el.style.display = "";
   hiddenNativeEls.clear();

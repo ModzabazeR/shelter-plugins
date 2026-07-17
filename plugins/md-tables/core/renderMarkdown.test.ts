@@ -26,6 +26,8 @@ describe("GFM rendering", () => {
     const boxes = el.querySelectorAll('input[type="checkbox"]');
     expect(boxes.length).toBe(2);
     boxes.forEach((b) => expect(b.hasAttribute("disabled")).toBe(true));
+    expect(boxes[0].hasAttribute("checked")).toBe(true);
+    expect(boxes[1].hasAttribute("checked")).toBe(false);
   });
 
   it("renders fenced code with escaped content and language class", () => {
@@ -139,5 +141,21 @@ describe("sanitization", () => {
     const el = mount('```\n<script>alert(1)</script>\n```');
     expect(el.querySelector("script")).toBeNull();
     expect(el.querySelector("pre code")?.textContent).toContain("<script>alert(1)</script>");
+  });
+
+  it("removes formaction and svg xlink:href vectors", () => {
+    const out = renderMarkdownToHtml(
+      '<button formaction="javascript:evil()">x</button>\n\n<svg><a xlink:href="javascript:evil()">y</a></svg>',
+    );
+    expect(out).not.toContain("formaction");
+    expect(out).not.toContain("xlink:href");
+    expect(out).not.toContain("javascript:");
+  });
+
+  it("strips data-* attributes", () => {
+    const out = renderMarkdownToHtml('<p data-mdt-inserted="1" data-x="y">hi</p>');
+    expect(out).not.toContain("data-mdt-inserted");
+    expect(out).not.toContain("data-x");
+    expect(out).toContain("hi");
   });
 });
