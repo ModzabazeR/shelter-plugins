@@ -1,0 +1,5 @@
+{
+  "name": "HTML Viewer",
+  "author": "modda",
+  "description": "Renders .html file attachments inline in a locked sandbox, with a CDN-rendering Full view and per-user/server auto-render."
+}

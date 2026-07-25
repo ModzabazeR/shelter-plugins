@@ -1,0 +1,8 @@
+{
+  "name": "html-viewer",
+  "private": true,
+  "type": "module",
+  "dependencies": {
+    "solid-js": "1.6.16"
+  }
+}

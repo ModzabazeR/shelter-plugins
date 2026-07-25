@@ -4,6 +4,19 @@ A collection of [Shelter](https://shelter.uwu.network) plugins for Discord, buil
 
 ## Plugins
 
+### HTML Viewer (`html-viewer`)
+Renders `.html` file attachments inline in Discord, inside a sandboxed iframe — for reading AI-generated artifacts without leaving the client.
+
+**Install:** User Settings → Shelter → Settings → Plugins → Add Plugin, then paste:
+`https://modzabazer.github.io/shelter-plugins/html-viewer/`
+
+- Inline render is near-offline: an injected CSP allows only a trusted-CDN allowlist (jsdelivr/unpkg/cdnjs/tailwind/google-fonts/esm.sh) for styles, fonts and scripts.
+- Full view widens the CSP to any HTTPS CDN, while `connect-src 'none'` blocks fetch/XHR/WebSocket/beacon egress in **both** tiers.
+- The iframe is `sandbox="allow-scripts"` with an opaque origin, so artifact code can never reach Discord's token or DOM.
+- Per-user and per-server auto-render allowlists, plus Download.
+
+> Moved here from the standalone [`html-viewer`](https://github.com/ModzabazeR/html-viewer) repo, which is now deprecated. If you installed the old `…/html-viewer/html-viewer/` URL, remove it and add the one above.
+
 ### Markdown Tables (`md-tables`)
 Renders GFM markdown tables inline in Discord messages — Discord doesn't render tables, this fixes that.
 
