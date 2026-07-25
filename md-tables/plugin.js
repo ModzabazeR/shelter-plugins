@@ -4280,7 +4280,8 @@ const CSS = `
 .mdt-note{padding:8px 10px;font-size:12px;color:var(--text-muted,#949ba4);border-top:1px solid var(--background-modifier-accent,rgba(255,255,255,.09))}
 .mdt-error{color:var(--text-danger,#f23f42)}
 .mdt-doc{padding:10px 14px;max-height:480px;overflow-y:auto;color:var(--text-normal,#dbdee1);font-size:.95rem;line-height:1.5;border-top:1px solid var(--background-modifier-accent,rgba(255,255,255,.09))}
-.mdt-doc-modal{max-height:none;border-top:none}
+/* Full view must stay viewport-bounded: an unbounded doc grows the modal past the top and bottom of the screen. Scroll inside the body instead. */
+.mdt-doc-modal{max-height:75vh;border-top:none}
 .mdt-doc h1,.mdt-doc h2,.mdt-doc h3,.mdt-doc h4,.mdt-doc h5,.mdt-doc h6{margin:14px 0 6px;color:var(--header-primary,#f2f3f5);line-height:1.25}
 .mdt-doc h1{font-size:1.5rem;padding-bottom:4px;border-bottom:1px solid var(--background-modifier-accent,rgba(255,255,255,.1))}
 .mdt-doc h2{font-size:1.25rem;padding-bottom:3px;border-bottom:1px solid var(--background-modifier-accent,rgba(255,255,255,.08))}
@@ -4294,7 +4295,7 @@ const CSS = `
 .mdt-doc :not(pre)>code{background:var(--background-secondary-alt,rgba(255,255,255,.08));padding:0 4px;border-radius:3px}
 .mdt-doc a{color:var(--text-link,#00a8fc)}
 .mdt-doc hr{border:none;border-top:1px solid var(--background-modifier-accent,rgba(255,255,255,.1));margin:12px 0}
-.mdt-modal{width:min(1100px,92vw)!important;max-width:1100px!important}
+.mdt-modal{width:min(1100px,92vw)!important;max-width:1100px!important;max-height:90vh!important}
 `;
 const MAX_INLINE_KB = 512;
 const MAX_INLINE_BYTES = MAX_INLINE_KB * 1024;
